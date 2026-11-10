@@ -1,0 +1,43 @@
+# Dashboard + API + PostgreSQL:   docker compose up --build
+# then open http://127.0.0.1:3000 and stream a run into it:
+#   PAYCHAOS_TOKEN=pct_... paychaos -upstream mock -report-to http://127.0.0.1:3000
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: paychaos
+      POSTGRES_PASSWORD: paychaos
+      POSTGRES_DB: paychaos
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paychaos"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: .
+    image: paychaos:local
+    environment:
+      DATABASE_URL: postgres://paychaos:paychaos@db:5432/paychaos
+      # Set to require a bearer token on dashboard routes (16+ characters):
+      #   ADMIN_TOKEN=$(openssl rand -hex 24) docker compose up --build
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # The API refuses to run an open dashboard on a public address. The
+      # port below is published on 127.0.0.1 only, so an open dashboard is
+      # reachable from this machine alone. If you publish it more widely,
+      # set ADMIN_TOKEN and set this to false.
+      ALLOW_OPEN_DASHBOARD: ${ALLOW_OPEN_DASHBOARD:-true}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
