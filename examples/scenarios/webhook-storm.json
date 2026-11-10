@@ -1,0 +1,11 @@
+{
+  "seed": 5,
+  "rules": [],
+  "webhooks": {
+    "duplicate_probability": 0.8,
+    "duplicate_count": 2,
+    "max_delay_ms": 300,
+    "reorder_window_ms": 3000
+  },
+  "min_backoff_ms": 200
+}

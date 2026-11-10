@@ -1,0 +1,37 @@
+{
+  "seed": 7,
+  "rules": [
+    {
+      "name": "lost-response-on-order",
+      "match": { "method": "POST", "path_prefix": "/v2/checkout/orders" },
+      "fault": "drop_after_commit",
+      "probability": 0.2
+    },
+    {
+      "name": "lost-response-on-refund",
+      "match": { "method": "POST", "path_prefix": "/v2/payments/captures" },
+      "fault": "drop_after_commit",
+      "probability": 0.4
+    },
+    {
+      "name": "token-expired",
+      "match": { "method": "POST" },
+      "fault": "token_expired_401",
+      "probability": 0.03
+    },
+    {
+      "name": "rate-limited",
+      "match": { "method": "POST" },
+      "fault": "rate_limit_429",
+      "probability": 0.08
+    }
+  ],
+  "webhooks": {
+    "duplicate_probability": 0.5,
+    "duplicate_count": 1,
+    "max_delay_ms": 200,
+    "reorder_window_ms": 1000
+  },
+  "min_backoff_ms": 200,
+  "operation_id": ["purchase_units.0.invoice_id", "invoice_id"]
+}

@@ -1,0 +1,45 @@
+# Example workflow for an application repository: run your integration tests
+# through paychaos on the pull request and on its base branch with the same
+# seed and scenario, then fail only on findings the pull request introduces.
+#
+# Assumes your tests read the PayPal API base URL from PAYPAL_API_BASE and
+# that `make integration-test` drives your checkout flow.
+name: paychaos
+
+on:
+  pull_request:
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go install github.com/shangai2405/paychaos/cmd/paychaos@latest
+
+      - name: baseline (base branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+      - run: |
+          paychaos -upstream mock -config paychaos.json -report baseline.json -fail-on-high=false &
+          sleep 1
+          PAYPAL_API_BASE=http://127.0.0.1:8080 make integration-test || true
+          kill -INT %1; wait %1 || true
+          cp baseline.json "$RUNNER_TEMP/baseline.json"
+
+      - name: current (pull request)
+        uses: actions/checkout@v4
+      - run: |
+          paychaos -upstream mock -config paychaos.json -report current.json -fail-on-high=false \
+            -junit paychaos-junit.xml -markdown "$GITHUB_STEP_SUMMARY" &
+          sleep 1
+          PAYPAL_API_BASE=http://127.0.0.1:8080 make integration-test || true
+          kill -INT %1; wait %1 || true
+
+      - name: fail on new findings
+        run: paychaos compare -fail-on medium "$RUNNER_TEMP/baseline.json" current.json
+
+      # Optional: stream both runs to a shared dashboard as well, by adding
+      #   -report-to ${{ vars.PAYCHAOS_API }}   with   env: PAYCHAOS_TOKEN: ${{ secrets.PAYCHAOS_TOKEN }}

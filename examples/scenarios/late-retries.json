@@ -1,0 +1,15 @@
+{
+  "seed": 13,
+  "rules": [
+    {
+      "name": "slow-refund-response",
+      "match": { "method": "POST", "path_prefix": "/v2/payments/captures" },
+      "fault": "hold_response",
+      "probability": 0.5,
+      "delay_ms": 15000
+    }
+  ],
+  "webhooks": { "duplicate_probability": 0, "duplicate_count": 0, "max_delay_ms": 0, "reorder_window_ms": 0 },
+  "operation_id": ["invoice_id"],
+  "min_backoff_ms": 200
+}
