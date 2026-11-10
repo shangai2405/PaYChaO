@@ -1,0 +1,135 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet and gofmt
+        run: make vet
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+      - run: make validate
+      - name: tests (race detector)
+        run: make test
+      - name: coverage (fails below 75%)
+        run: make cover
+      - run: make demo
+
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - name: tests with coverage (fails below 80% of lines)
+        run: npm run test:coverage
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  # The engine streaming a real run into the real API and database.
+  end-to-end:
+    needs: [engine, api]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: paychaos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: api
+      - run: ./scripts/e2e.sh
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/paychaos
+      - run: npm ci
+        working-directory: web
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - name: browser tests (desktop workflows; desktop, tablet and phone layouts)
+        run: ./scripts/ui-e2e.sh
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/paychaos
+
+  # The production image builds, refuses an unsafe configuration, and serves
+  # the dashboard and API against a real database.
+  docker:
+    needs: [api, web]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: paychaos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t paychaos:ci .
+      - name: refuses an open dashboard on a public address
+        run: |
+          if docker run --rm --network host -e DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/paychaos -e PORT=3300 paychaos:ci; then
+            echo "expected the API to refuse to start"; exit 1
+          fi
+      - name: serves with an admin token
+        run: |
+          docker run -d --name pc --network host -e DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/paychaos \
+            -e PORT=3300 -e ADMIN_TOKEN=ci-admin-token-0123456789 paychaos:ci
+          for _ in $(seq 1 50); do curl -sf http://127.0.0.1:3300/api/health && break; sleep 0.3; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3300/api/projects)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-admin-token-0123456789' http://127.0.0.1:3300/api/projects)" = 200
+          curl -sf http://127.0.0.1:3300/ | grep -q '<div id="root">'
+          docker rm -f pc
