@@ -9,7 +9,6 @@ Around the engine sit a Node/TypeScript API, a PostgreSQL store and a React dash
 
 ![Project overview: health of the latest run, findings per run, recurring problems with fix guides](docs/screenshots/project-overview.png)
 
-> The Stripe version of this project is preserved at tag [`v1.0-stripe`](https://github.com/shangai2405/paychaos/tree/v1.0-stripe).
 
 ![make demo: the naive client turns 20 checkouts into 24 orders and an extra refund](docs/demo.gif)
 
