@@ -1,45 +1,48 @@
-# Example workflow for an application repository: run your integration tests
-# through paychaos on the pull request and on its base branch with the same
-# seed and scenario, then fail only on findings the pull request introduces.
+# Pull-request check with a paychaos dashboard. Each run is compared with the
+# latest run on the base branch, so a pull request fails only on payment-safety
+# problems it introduces, and one comment on the pull request shows the verdict
+# (updated on every push, never duplicated).
 #
-# Assumes your tests read the PayPal API base URL from PAYPAL_API_BASE and
-# that `make integration-test` drives your checkout flow.
+# Setup, once:
+#   1. In the dashboard, create a project, an ingest token and (optionally) a
+#      scenario, e.g. "checkout-strict".
+#   2. Repository secret PAYCHAOS_TOKEN = the ingest token;
+#      repository variable PAYCHAOS_API = the dashboard URL.
+#   3. Your tests read the PayPal API base URL from PAYCHAOS_PROXY_URL (paychaos
+#      sets it for the command after --), or point them at http://127.0.0.1:8080.
+#
+# The push to main keeps the baseline fresh; problem status in the dashboard
+# moves only with runs on the default branch.
 name: paychaos
 
 on:
   pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write   # only for the verdict comment; uses the job's own token
 
 jobs:
   chaos:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
       - run: go install github.com/shangai2405/paychaos/cmd/paychaos@latest
 
-      - name: baseline (base branch)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.base_ref }}
-      - run: |
-          paychaos -upstream mock -config paychaos.json -report baseline.json -fail-on-high=false &
-          sleep 1
-          PAYPAL_API_BASE=http://127.0.0.1:8080 make integration-test || true
-          kill -INT %1; wait %1 || true
-          cp baseline.json "$RUNNER_TEMP/baseline.json"
-
-      - name: current (pull request)
-        uses: actions/checkout@v4
-      - run: |
-          paychaos -upstream mock -config paychaos.json -report current.json -fail-on-high=false \
-            -junit paychaos-junit.xml -markdown "$GITHUB_STEP_SUMMARY" &
-          sleep 1
-          PAYPAL_API_BASE=http://127.0.0.1:8080 make integration-test || true
-          kill -INT %1; wait %1 || true
-
-      - name: fail on new findings
-        run: paychaos compare -fail-on medium "$RUNNER_TEMP/baseline.json" current.json
-
-      # Optional: stream both runs to a shared dashboard as well, by adding
-      #   -report-to ${{ vars.PAYCHAOS_API }}   with   env: PAYCHAOS_TOKEN: ${{ secrets.PAYCHAOS_TOKEN }}
+      - name: payment-safety check
+        env:
+          PAYCHAOS_TOKEN: ${{ secrets.PAYCHAOS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          paychaos ci -upstream mock -scenario checkout-strict -seed 7 \
+            -report-to "${{ vars.PAYCHAOS_API }}" \
+            -junit paychaos-junit.xml \
+            -- make integration-test
+        # Exit 2 when the pull request adds a HIGH problem (-fail-on new-high,
+        # the default with `ci`). Use -fail-on new-any to be stricter, or
+        # -fail-on high to fail on every HIGH finding regardless of the base.

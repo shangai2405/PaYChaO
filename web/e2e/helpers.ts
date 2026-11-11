@@ -12,13 +12,21 @@ export async function seedProject(request: APIRequestContext, name: string) {
 export async function seedRun(
   request: APIRequestContext,
   token: string,
-  opts: { name: string; startedAt: string; high?: number; medium?: number },
+  opts: {
+    name: string;
+    startedAt: string;
+    high?: number;
+    medium?: number;
+    /** Amount on each HIGH finding, in minor units of USD. */
+    amountMinor?: number;
+    ci?: Record<string, unknown>;
+  },
 ) {
   const id = randomUUID();
   const headers = { authorization: `Bearer ${token}` };
   await request.put(`/api/ingest/runs/${id}`, {
     headers,
-    data: { name: opts.name, seed: 7, upstream: 'mock', scenario: { seed: 7, rules: [] }, started_at: opts.startedAt, engine_version: 'e2e' },
+    data: { name: opts.name, seed: 7, upstream: 'mock', scenario: { seed: 7, rules: [] }, started_at: opts.startedAt, engine_version: 'e2e', ci: opts.ci },
   });
   const rec = (seq: number, fault = 'none') => ({
     kind: 'request',
@@ -33,6 +41,7 @@ export async function seedRun(
       code: 'UNSAFE_RETRY_AFTER_LOST_RESPONSE', severity: 'HIGH', path: '/v2/checkout/orders', operation: 'create_order', fingerprint: 'fp1',
       requests: [1, 2], object_ids: ['ORDER-1', 'ORDER-2'], at: opts.startedAt,
       message: 'request #1 succeeded upstream but its response was lost; retry #2 also succeeded',
+      ...(opts.amountMinor ? { amount_minor: opts.amountMinor, currency: 'USD' } : {}),
     })),
     ...Array.from({ length: opts.medium ?? 0 }, () => ({
       code: 'MISSING_REQUEST_ID', severity: 'MEDIUM', path: '/v2/checkout/orders', operation: 'create_order', fingerprint: 'fp1',

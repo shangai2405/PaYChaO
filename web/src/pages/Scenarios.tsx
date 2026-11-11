@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, del, post, put, type Issue, type Project, type Scenario } from '../api';
-import { Crumbs, Empty, ErrorBox, PageHeader, Section, Skeleton, useConfirm, useToast } from '../components/ui';
+import { CopyButton, Crumbs, Empty, ErrorBox, PageHeader, Section, Skeleton, useConfirm, useToast } from '../components/ui';
 import { when } from '../format';
 
 export const FAULTS = [
@@ -134,7 +134,9 @@ export function Scenarios() {
                 <button className="link" onClick={() => open(s)}>
                   {s.name}
                 </button>
-                <span className="muted">updated {when(s.updated_at)}</span>
+                <span className="muted">
+                  {s.version ? `v${s.version} · ` : ''}updated {when(s.updated_at)}
+                </span>
               </li>
             ))}
           </ul>
@@ -191,8 +193,24 @@ export function Scenarios() {
               </button>
             )}
           </div>
+          {editing && !dirty && (
+            <div className="copy-row">
+              <pre className="copy">{`paychaos -scenario ${shellQuote(editing.name)} -report-to ${window.location.origin}`}</pre>
+              <CopyButton text={`paychaos -scenario ${shellQuote(editing.name)} -report-to ${window.location.origin}`} />
+            </div>
+          )}
+          {editing && !dirty && (
+            <p className="muted small">
+              The engine loads the saved version (v{editing.version ?? 1}) by name with its ingest token, and each run records which version it used.
+            </p>
+          )}
         </Section>
       </div>
     </>
   );
+}
+
+/** Quotes a name for a POSIX shell when it needs it. */
+function shellQuote(s: string): string {
+  return /^[A-Za-z0-9._-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }

@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Finding } from '../api';
 import { guideFor, type Guide } from '../guides';
-import { CopyButton, SeverityBadge } from './ui';
+import { amountText } from '../format';
+import { CopyButton, IssueChip, SeverityBadge } from './ui';
 
 export function GuideBody({ g }: { g: Guide }) {
   return (
@@ -44,6 +45,12 @@ export function FindingCard({ f }: { f: Finding }) {
       <div className="finding-head">
         <SeverityBadge s={f.severity} />
         <span className="finding-title">{g?.title ?? f.code}</span>
+        {f.issue_status && <IssueChip status={f.issue_status} ignored={!!f.issue_ignored_at} />}
+        {amountText(f) && (
+          <span className="at-risk" title="Amount of the payment this finding puts at risk">
+            {amountText(f)} at risk
+          </span>
+        )}
       </div>
       <div className="finding-meta">
         <code>{f.code}</code>

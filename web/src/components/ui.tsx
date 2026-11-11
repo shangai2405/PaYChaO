@@ -9,7 +9,8 @@ import {
   type ReactNode,
 } from 'react';
 import { Link } from 'react-router-dom';
-import { ApiError, type HealthStatus, type Severity } from '../api';
+import { ApiError, type HealthStatus, type IssueStatus, type MoneyTotal, type Severity } from '../api';
+import { moneyText } from '../format';
 
 export function SeverityBadge({ s }: { s: Severity }) {
   return <span className={`badge sev-${s.toLowerCase()}`}>{s}</span>;
@@ -21,6 +22,34 @@ export function Counts({ high, medium, low }: { high: number; medium: number; lo
       <span className={`count sev-high ${high ? '' : 'zero'}`}>{high} high</span>
       <span className={`count sev-medium ${medium ? '' : 'zero'}`}>{medium} med</span>
       <span className={`count sev-low ${low ? '' : 'zero'}`}>{low} low</span>
+    </span>
+  );
+}
+
+/**
+ * Money at risk, one total per currency. Shows "none" only when the data says
+ * so; runs stored before amounts were recorded have no value, shown as "—".
+ */
+export function Money({ totals, empty = 'none' }: { totals: MoneyTotal[] | null | undefined; empty?: string }) {
+  if (totals === null || totals === undefined) return <span className="muted">—</span>;
+  if (totals.length === 0) return <span className="muted">{empty}</span>;
+  return <span className="money">{moneyText(totals)}</span>;
+}
+
+const ISSUE: Record<IssueStatus, { label: string; title: string }> = {
+  new: { label: 'new', title: 'First seen in this or a recent run' },
+  open: { label: 'still open', title: 'Seen in earlier runs too' },
+  regressed: { label: 'regressed', title: 'Was fixed, then came back' },
+  fixed: { label: 'fixed', title: 'A later run exercised it and it did not happen' },
+};
+
+/** Where a problem stands across runs; text, never colour alone. */
+export function IssueChip({ status, ignored }: { status: IssueStatus; ignored?: boolean }) {
+  if (ignored) return <span className="chip chip-ignored" title="Ignored by a team member">ignored</span>;
+  const i = ISSUE[status];
+  return (
+    <span className={`chip chip-${status}`} title={i.title}>
+      {i.label}
     </span>
   );
 }
@@ -204,6 +233,8 @@ export interface ConfirmOptions {
   danger?: boolean;
   /** When set, the user must type this to enable the confirm button. */
   typeToConfirm?: string;
+  /** An optional free-text field (a reason, say); its value goes to the action. */
+  input?: { label: string; placeholder?: string; maxLength?: number };
 }
 
 /**
@@ -220,15 +251,17 @@ export function ConfirmDialog({
   open: boolean;
   options: ConfirmOptions;
   busy?: boolean;
-  onConfirm: () => void;
+  onConfirm: (input: string) => void;
   onCancel: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [typed, setTyped] = useState('');
+  const [text, setText] = useState('');
   const titleId = useId();
   useEffect(() => {
     if (!open) return;
     setTyped('');
+    setText('');
     const prev = document.activeElement as HTMLElement | null;
     ref.current?.querySelector<HTMLElement>('input, button')?.focus();
     return () => prev?.focus?.();
@@ -268,11 +301,24 @@ export function ConfirmDialog({
             <input value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" />
           </label>
         )}
+        {options.input && (
+          <label className="field">
+            <span>{options.input.label}</span>
+            <input
+              value={text}
+              placeholder={options.input.placeholder}
+              maxLength={options.input.maxLength}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !busy && !blocked && onConfirm(text.trim())}
+              autoComplete="off"
+            />
+          </label>
+        )}
         <div className="modal-actions">
           <button className="secondary" onClick={onCancel} disabled={busy}>
             Cancel
           </button>
-          <button className={options.danger ? 'danger-solid' : ''} onClick={onConfirm} disabled={busy || blocked}>
+          <button className={options.danger ? 'danger-solid' : ''} onClick={() => onConfirm(text.trim())} disabled={busy || blocked}>
             {busy ? 'Working…' : options.confirm}
           </button>
         </div>
@@ -283,21 +329,24 @@ export function ConfirmDialog({
 
 /** Hook form of ConfirmDialog: `ask(options, action)`, and render `dialog`. */
 export function useConfirm() {
-  const [state, setState] = useState<{ options: ConfirmOptions; action: () => Promise<unknown> } | null>(null);
+  const [state, setState] = useState<{ options: ConfirmOptions; action: (input: string) => Promise<unknown> } | null>(null);
   const [busy, setBusy] = useState(false);
   const toast = useToast();
-  const ask = useCallback((options: ConfirmOptions, action: () => Promise<unknown>) => setState({ options, action }), []);
+  const ask = useCallback(
+    (options: ConfirmOptions, action: (input: string) => Promise<unknown>) => setState({ options, action }),
+    [],
+  );
   const dialog = (
     <ConfirmDialog
       open={!!state}
       busy={busy}
       options={state?.options ?? { title: '', body: null, confirm: '' }}
       onCancel={() => setState(null)}
-      onConfirm={() => {
+      onConfirm={(input) => {
         if (!state) return;
         setBusy(true);
         state
-          .action()
+          .action(input)
           .then(() => setState(null))
           .catch((e: Error) => toast(e.message, 'error'))
           .finally(() => setBusy(false));

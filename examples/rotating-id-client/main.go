@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	base := flag.String("base", "http://127.0.0.1:8080", "API base URL (point at paychaos)")
+	base := flag.String("base", pp.DefaultBase(), "API base URL (point at paychaos; default $PAYCHAOS_PROXY_URL)")
 	n := flag.Int("n", 20, "number of checkouts to simulate")
 	flag.Parse()
 

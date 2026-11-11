@@ -2,6 +2,13 @@
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW';
 
+/** Money in minor units of one currency (amount_minor may arrive as a string: it is a bigint). */
+export interface MoneyTotal {
+  currency: string;
+  amount_minor: number | string;
+  findings: number;
+}
+
 export interface LatestRun {
   id: string;
   name: string;
@@ -9,6 +16,7 @@ export interface LatestRun {
   high: number;
   medium: number;
   low: number;
+  money_at_risk?: MoneyTotal[] | null;
 }
 
 export interface Project {
@@ -19,6 +27,8 @@ export interface Project {
   run_count?: number;
   last_run_at?: string | null;
   latest?: LatestRun | null;
+  default_branch?: string;
+  open_issues?: number;
 }
 
 export type HealthStatus = 'no_runs' | 'passing' | 'warning' | 'failing';
@@ -44,6 +54,7 @@ export interface Health {
     fixed_findings: number;
     comparable: boolean;
   } | null;
+  issues?: Record<IssueStatus, number>;
 }
 
 export interface Run {
@@ -61,6 +72,16 @@ export interface Run {
   medium: number;
   low: number;
   faults_applied: Record<string, number>;
+  money_at_risk?: MoneyTotal[] | null;
+  scenario_name?: string;
+  scenario_version?: number | null;
+  ci_provider?: string;
+  repo?: string;
+  branch?: string;
+  commit_sha?: string;
+  pr_number?: number | null;
+  base_branch?: string;
+  ci_url?: string;
   scenario?: unknown;
   webhooks?: WebhookSummary[];
   webhook_notes?: string[];
@@ -78,6 +99,11 @@ export interface Finding {
   object_ids: string[];
   at: string;
   final: boolean;
+  amount_minor?: string | null;
+  currency?: string | null;
+  issue_id?: string | null;
+  issue_status?: IssueStatus | null;
+  issue_ignored_at?: string | null;
 }
 
 export interface Attempt {
@@ -93,6 +119,8 @@ export interface Attempt {
   object_id: string;
   committed: boolean;
   response_delivered: boolean;
+  amount_minor?: string | number | null;
+  currency?: string | null;
 }
 
 export interface Operation {
@@ -137,9 +165,64 @@ export interface Token {
 export interface Scenario {
   id: string;
   name: string;
+  version?: number;
   config: unknown;
   created_at: string;
   updated_at: string;
+}
+
+export type IssueStatus = 'new' | 'open' | 'regressed' | 'fixed';
+
+/** A problem tracked across runs (api/src/issues.ts). */
+export interface TrackedIssue {
+  id: string;
+  key: string;
+  code: string;
+  severity: Severity;
+  operation: string;
+  path: string;
+  message: string;
+  status: IssueStatus;
+  times_seen: number;
+  first_seen_run: string | null;
+  first_seen_at: string;
+  last_seen_run: string | null;
+  last_seen_at: string;
+  fixed_run: string | null;
+  fixed_at: string | null;
+  regressed_at: string | null;
+  amount_minor: string | null;
+  currency: string | null;
+  ignored_at: string | null;
+  ignored_reason: string;
+}
+
+export interface VerdictItem {
+  key: string;
+  code: string;
+  severity: Severity;
+  operation: string;
+  path: string;
+  message: string;
+  count: number;
+  money_at_risk: MoneyTotal[];
+}
+
+/** A run judged against its base branch (api/src/verdict.ts). */
+export interface Verdict {
+  run: { id: string; branch: string; commit_sha: string; pr_number: number | null; base_branch: string };
+  baseline: { id: string; name: string; branch: string; commit_sha: string; started_at: string; seed: string } | null;
+  base_branch: string;
+  new: VerdictItem[];
+  fixed: VerdictItem[];
+  unchanged: VerdictItem[];
+  not_retested: VerdictItem[];
+  ignored: VerdictItem[];
+  money_at_risk: MoneyTotal[];
+  new_money_at_risk: MoneyTotal[];
+  worst_new: Severity | null;
+  comparable: boolean;
+  markdown: string;
 }
 
 export interface CompareRow {

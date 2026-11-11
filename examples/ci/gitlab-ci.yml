@@ -1,0 +1,17 @@
+# Merge-request check with a paychaos dashboard (GitLab CI). The verdict is
+# printed in the job log and the run links back to the pipeline; GitLab does
+# not get a comment (paychaos only comments on GitHub).
+#
+# CI/CD variables: PAYCHAOS_TOKEN (masked) and PAYCHAOS_API.
+paychaos:
+  image: golang:1.24
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - go install github.com/shangai2405/paychaos/cmd/paychaos@latest
+    - paychaos ci -upstream mock -scenario checkout-strict -seed 7 -report-to "$PAYCHAOS_API" -junit paychaos-junit.xml -- make integration-test
+  artifacts:
+    when: always
+    reports:
+      junit: paychaos-junit.xml

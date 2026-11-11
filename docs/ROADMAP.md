@@ -36,6 +36,8 @@ Still open:
 
 ## 4. Feature proposals
 
+> **Update, 10 November 2026.** F1 (money at risk), F2 (sandbox verification), F3 (pull-request bot) and F7 (automatic spill upload) are built, together with two items from the product audit: problems tracked across runs (new, open, fixed, regressed, ignored) and scenarios loaded by name with versions. See ADR-10 to ADR-14 and the QA report. F2's command exists and is tested against the mock; it has not yet been run against a real sandbox account.
+
 Each proposal states the problem it solves. Effort: S (days), M (1–2 weeks), L (a month or more).
 
 | # | Feature | Problem it solves | Impact | Effort |
@@ -69,8 +71,8 @@ The core verdicts (was a duplicate created, was a retry safe) must stay determin
 
 Ordered by impact over effort, and by dependency:
 
-1. **Now (next 2–4 weeks):** F1 money at risk, F3 PR bot, F7 spill upload. Small, independent, and they make the value visible.
-2. **Next (1–2 months):** F2 sandbox verification, F5 seed sweeps, F4 scenario recommendations.
+1. **Done:** F1 money at risk, F3 PR bot, F7 spill upload, F2 sandbox verification (needs a first real sandbox run), problems across runs, scenarios by name.
+2. **Next (1–2 months):** run `verify-sandbox` against a real sandbox and commit the profile; F5 seed sweeps; F4 scenario recommendations; a resilience score built on the issue history.
 3. **Later (quarter):** F6 accounts and audit log, F8 providers, F9 webhook handler auditing, F10 assistant.
 
 ## 7. Long-term vision

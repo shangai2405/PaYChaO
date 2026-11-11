@@ -10,9 +10,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
+
+// DefaultBase is where the example clients send requests: the proxy that
+// `paychaos ... -- client` started (PAYCHAOS_PROXY_URL), or the default
+// proxy address.
+func DefaultBase() string {
+	if u := os.Getenv("PAYCHAOS_PROXY_URL"); u != "" {
+		return u
+	}
+	return "http://127.0.0.1:8080"
+}
 
 // Client talks to the PayPal REST API (or paychaos in front of it).
 type Client struct {

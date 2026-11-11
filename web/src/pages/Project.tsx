@@ -1,7 +1,7 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, del, patch, post, type Health, type Project as P, type Run, type Token } from '../api';
+import { api, del, patch, post, type Health, type IssueStatus, type Project as P, type Run, type Token, type TrackedIssue } from '../api';
 import { TrendChart } from '../components/TrendChart';
 import {
   CopyButton,
@@ -10,6 +10,8 @@ import {
   Empty,
   ErrorBox,
   HealthBadge,
+  IssueChip,
+  Money,
   PageHeader,
   Section,
   SeverityBadge,
@@ -18,11 +20,12 @@ import {
   useConfirm,
   useToast,
 } from '../components/ui';
-import { ago, duration, when } from '../format';
+import { ago, amountText, duration, when } from '../format';
 import { guideFor } from '../guides';
 import { useLive } from '../live';
 
-type Tab = 'overview' | 'runs' | 'tokens';
+type Tab = 'overview' | 'issues' | 'runs' | 'tokens';
+const TABS: Tab[] = ['overview', 'issues', 'runs', 'tokens'];
 
 function Overview({ projectId }: { projectId: string }) {
   const q = useQuery({ queryKey: ['health', projectId], queryFn: () => api<Health>(`/api/projects/${projectId}/health`) });
@@ -62,6 +65,23 @@ function Overview({ projectId }: { projectId: string }) {
           {h.latest && <span className="kpi-value">{h.latest.high + h.latest.medium + h.latest.low}</span>}
           {h.latest && <Counts high={h.latest.high} medium={h.latest.medium} low={h.latest.low} />}
         </div>
+        <div className="kpi">
+          <span className="kpi-label">Money at risk in latest run</span>
+          <span className="kpi-value">
+            <Money totals={h.latest?.money_at_risk} />
+          </span>
+          <span className="kpi-sub">Payments the findings could charge twice, refund twice or lose track of.</span>
+        </div>
+        {h.issues && (
+          <div className="kpi">
+            <span className="kpi-label">Open problems</span>
+            <span className="kpi-value">{h.issues.new + h.issues.open + h.issues.regressed}</span>
+            <span className="kpi-sub">
+              {h.issues.new} new · {h.issues.regressed} regressed · {h.issues.fixed} fixed ·{' '}
+              <Link to="?tab=issues">See all</Link>
+            </span>
+          </div>
+        )}
         <div className="kpi">
           <span className="kpi-label">Since the run before</span>
           {c ? (
@@ -109,6 +129,146 @@ function Overview({ projectId }: { projectId: string }) {
         </Section>
       )}
     </>
+  );
+}
+
+type IssueFilter = 'active' | IssueStatus | 'ignored' | 'all';
+const ISSUE_FILTERS: { id: IssueFilter; label: string }[] = [
+  { id: 'active', label: 'Open' },
+  { id: 'regressed', label: 'Regressed' },
+  { id: 'new', label: 'New' },
+  { id: 'fixed', label: 'Fixed' },
+  { id: 'ignored', label: 'Ignored' },
+  { id: 'all', label: 'All' },
+];
+
+/**
+ * Problems tracked across runs: one row per problem however many runs saw
+ * it. Status moves only with runs on the default branch; a problem is fixed
+ * only when a later run tried the same operation under a fault that could
+ * have shown it.
+ */
+function Issues({ projectId }: { projectId: string }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { ask, dialog } = useConfirm();
+  const [filter, setFilter] = useState<IssueFilter>('active');
+  const q = useQuery({
+    queryKey: ['issues', projectId, filter],
+    queryFn: () => api<{ issues: TrackedIssue[]; default_branch: string }>(`/api/projects/${projectId}/issues?status=${filter}`),
+  });
+  const setIgnored = async (i: TrackedIssue, ignored: boolean, reason = '') => {
+    await patch(`/api/issues/${i.id}`, { ignored, reason });
+    await qc.invalidateQueries({ queryKey: ['issues', projectId] });
+    await qc.invalidateQueries({ queryKey: ['health', projectId] });
+    toast(ignored ? 'Problem ignored' : 'Problem restored');
+  };
+  return (
+    <Section
+      title="Problems across runs"
+      description={
+        q.data?.default_branch ? (
+          <>
+            Status follows runs on <code>{q.data.default_branch}</code>. Pull-request runs are judged against it and never change it.
+          </>
+        ) : (
+          'Status follows every run until the project learns its default branch from CI (or you set it under Edit).'
+        )
+      }
+    >
+      {dialog}
+      <div className="filters" role="group" aria-label="Filter problems">
+        {ISSUE_FILTERS.map((f) => (
+          <button key={f.id} aria-pressed={filter === f.id} onClick={() => setFilter(f.id)}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+      <ErrorBox error={q.error} onRetry={() => void q.refetch()} />
+      {q.isPending && <Skeleton rows={4} height={36} />}
+      {q.data && q.data.issues.length === 0 && (
+        <Empty title={filter === 'active' ? 'No open problems' : 'Nothing here'}>
+          {filter === 'active' ? 'Every problem found so far is fixed or ignored.' : 'No problem has this status.'}
+        </Empty>
+      )}
+      {q.data && q.data.issues.length > 0 && (
+        <ul className="issues-list">
+          {q.data.issues.map((i) => {
+            const g = guideFor(i.code);
+            return (
+              <li key={i.id}>
+                <SeverityBadge s={i.severity} />
+                <div>
+                  <div className="issue-title">
+                    {g?.title ?? i.code}
+                    <IssueChip status={i.status} ignored={!!i.ignored_at} />
+                    {amountText(i) && <span className="at-risk">{amountText(i)} at risk</span>}
+                  </div>
+                  <div className="issue-meta">
+                    <code>{i.code}</code>
+                    <code>{i.operation || i.path}</code>
+                    <span>
+                      seen in {i.times_seen} run{i.times_seen === 1 ? '' : 's'}, first {ago(i.first_seen_at)}
+                    </span>
+                    {i.last_seen_run && (
+                      <Link to={`/runs/${i.last_seen_run}`} title={when(i.last_seen_at)}>
+                        last seen {ago(i.last_seen_at)}
+                      </Link>
+                    )}
+                    {i.fixed_run && i.fixed_at && (
+                      <Link to={`/runs/${i.fixed_run}`} title={when(i.fixed_at)}>
+                        fixed {ago(i.fixed_at)}
+                      </Link>
+                    )}
+                    {i.regressed_at && i.status === 'regressed' && <span>came back {ago(i.regressed_at)}</span>}
+                  </div>
+                  {i.ignored_at && (
+                    <div className="issue-meta">
+                      Ignored {ago(i.ignored_at)}
+                      {i.ignored_reason ? `: ${i.ignored_reason}` : ''}
+                    </div>
+                  )}
+                </div>
+                <div className="issue-actions">
+                  {g && (
+                    <Link className="button secondary small" to={`/guides#${i.code}`}>
+                      Fix guide
+                    </Link>
+                  )}
+                  {i.ignored_at ? (
+                    <button className="secondary small" onClick={() => setIgnored(i, false).catch((e: Error) => toast(e.message, 'error'))}>
+                      Stop ignoring
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary small"
+                      onClick={() =>
+                        ask(
+                          {
+                            title: 'Ignore this problem?',
+                            body: (
+                              <p>
+                                Runs keep reporting <code>{i.code}</code> on <code>{i.operation || i.path}</code>, but pull-request verdicts stop
+                                counting it as new. You can undo this.
+                              </p>
+                            ),
+                            confirm: 'Ignore problem',
+                            input: { label: 'Reason (shown to your team)', placeholder: 'e.g. sandbox-only endpoint', maxLength: 500 },
+                          },
+                          (reason) => setIgnored(i, true, reason),
+                        )
+                      }
+                    >
+                      Ignore
+                    </button>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Section>
   );
 }
 
@@ -161,6 +321,7 @@ function Runs({ projectId }: { projectId: string }) {
                   <span className="sr-only">Select for comparison</span>
                 </th>
                 <th>Run</th>
+                <th className="hide-sm">Branch</th>
                 <th>Status</th>
                 <th>Started</th>
                 <th className="hide-sm">Duration</th>
@@ -182,6 +343,10 @@ function Runs({ projectId }: { projectId: string }) {
                   </td>
                   <td>
                     <Link to={`/runs/${r.id}`}>{r.name || r.id.slice(0, 8)}</Link>
+                  </td>
+                  <td className="hide-sm">
+                    {r.branch ? <code>{r.branch}</code> : <span className="muted">—</span>}
+                    {r.pr_number ? <span className="small muted"> · PR #{r.pr_number}</span> : null}
                   </td>
                   <td>
                     <StatusPill status={r.status} />
@@ -334,8 +499,10 @@ function EditProject({ project, onDone }: { project: P; onDone: () => void }) {
   const toast = useToast();
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description ?? '');
+  const [branch, setBranch] = useState(project.default_branch ?? '');
   const save = useMutation({
-    mutationFn: () => patch<P>(`/api/projects/${project.id}`, { name: name.trim(), description: description.trim() }),
+    mutationFn: () =>
+      patch<P>(`/api/projects/${project.id}`, { name: name.trim(), description: description.trim(), default_branch: branch.trim() }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['project', project.id] });
       void qc.invalidateQueries({ queryKey: ['projects'] });
@@ -360,6 +527,12 @@ function EditProject({ project, onDone }: { project: P; onDone: () => void }) {
           <span>Description</span>
           <input value={description} maxLength={500} onChange={(e) => setDescription(e.target.value)} />
         </label>
+        <label className="field">
+          <span>
+            Default branch <span className="muted">(runs on it update problem status; learned from CI if empty)</span>
+          </span>
+          <input value={branch} maxLength={200} placeholder="main" onChange={(e) => setBranch(e.target.value)} />
+        </label>
         <div className="row">
           <button type="submit" disabled={save.isPending || !name.trim()}>
             {save.isPending ? 'Saving…' : 'Save'}
@@ -381,10 +554,10 @@ export function Project() {
   const toast = useToast();
   const { ask, dialog } = useConfirm();
   const [params, setParams] = useSearchParams();
-  const tab = (['overview', 'runs', 'tokens'] as const).find((t) => t === params.get('tab')) ?? 'overview';
+  const tab = TABS.find((t) => t === params.get('tab')) ?? 'overview';
   const [editing, setEditing] = useState(false);
   const project = useQuery({ queryKey: ['project', id], queryFn: () => api<P>(`/api/projects/${id}`) });
-  const live = useLive({ project: id }, [['runs', id], ['projects'], ['health', id]]);
+  const live = useLive({ project: id }, [['runs', id], ['projects'], ['health', id], ['issues', id]]);
   const p = project.data;
 
   return (
@@ -443,7 +616,7 @@ export function Project() {
       )}
       {editing && p && <EditProject project={p} onDone={() => setEditing(false)} />}
       <div className="tabs" role="tablist" aria-label="Project sections">
-        {(['overview', 'runs', 'tokens'] as Tab[]).map((t) => (
+        {TABS.map((t) => (
           <button
             key={t}
             role="tab"
@@ -451,12 +624,13 @@ export function Project() {
             className={tab === t ? 'tab active' : 'tab'}
             onClick={() => setParams(t === 'overview' ? {} : { tab: t }, { replace: true })}
           >
-            {t[0]!.toUpperCase() + t.slice(1)}
+            {t === 'issues' ? 'Problems' : t[0]!.toUpperCase() + t.slice(1)}
           </button>
         ))}
       </div>
       <div role="tabpanel">
         {tab === 'overview' && <Overview projectId={id} />}
+        {tab === 'issues' && <Issues projectId={id} />}
         {tab === 'runs' && <Runs projectId={id} />}
         {tab === 'tokens' && <Tokens projectId={id} />}
       </div>

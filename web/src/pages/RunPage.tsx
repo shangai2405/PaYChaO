@@ -15,6 +15,7 @@ import {
 } from '../api';
 import { FindingCard } from '../components/FindingCard';
 import { Timeline } from '../components/Timeline';
+import { VerdictPanel } from '../components/Verdict';
 import {
   Counts,
   Crumbs,
@@ -22,6 +23,7 @@ import {
   ErrorBox,
   HealthBadge,
   healthOf,
+  Money,
   PageHeader,
   Section,
   Skeleton,
@@ -32,8 +34,9 @@ import {
 import { duration, when } from '../format';
 import { useLive } from '../live';
 
-type Tab = 'findings' | 'timeline' | 'webhooks' | 'scenario';
+type Tab = 'verdict' | 'findings' | 'timeline' | 'webhooks' | 'scenario';
 const TABS: { id: Tab; label: string }[] = [
+  { id: 'verdict', label: 'Verdict' },
   { id: 'findings', label: 'Findings' },
   { id: 'timeline', label: 'Retry timeline' },
   { id: 'webhooks', label: 'Webhooks' },
@@ -73,10 +76,14 @@ export function RunPage() {
   const toast = useToast();
   const { ask, dialog } = useConfirm();
   const [params, setParams] = useSearchParams();
-  const tab = TABS.find((t) => t.id === params.get('tab'))?.id ?? 'findings';
   const [sev, setSev] = useState<Severity | ''>('');
   const run = useQuery({ queryKey: ['run', id], queryFn: () => api<Run>(`/api/runs/${id}`) });
   const r = run.data;
+  // The verdict needs the run's final findings. A pull-request run opens on it.
+  const tabs = TABS.filter((t) => t.id !== 'verdict' || r?.status === 'finished');
+  const isPR = r?.pr_number !== null && r?.pr_number !== undefined;
+  const defaultTab: Tab = isPR && r?.status === 'finished' ? 'verdict' : 'findings';
+  const tab = tabs.find((t) => t.id === params.get('tab'))?.id ?? defaultTab;
   const project = useQuery({
     queryKey: ['project', r?.project_id],
     queryFn: () => api<Project>(`/api/projects/${r!.project_id}`),
@@ -151,10 +158,15 @@ export function RunPage() {
               </>
             }
           />
+          {(r.branch || r.scenario_name || r.ci_provider) && <CiLine r={r} />}
           <dl className="stats">
             <div>
               <dt>Findings</dt>
               <dd>{r.status === 'finished' ? <Counts high={r.high} medium={r.medium} low={r.low} /> : <span className="muted">provisional</span>}</dd>
+            </div>
+            <div>
+              <dt>Money at risk</dt>
+              <dd>{r.status === 'finished' ? <Money totals={r.money_at_risk} /> : <span className="muted">when the run finishes</span>}</dd>
             </div>
             <div>
               <dt>Audited requests</dt>
@@ -197,13 +209,13 @@ export function RunPage() {
       )}
 
       <div className="tabs" role="tablist" aria-label="Run sections">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.id}
             role="tab"
             aria-selected={tab === t.id}
             className={tab === t.id ? 'tab active' : 'tab'}
-            onClick={() => setParams(t.id === 'findings' ? {} : { tab: t.id }, { replace: true })}
+            onClick={() => setParams(t.id === defaultTab ? {} : { tab: t.id }, { replace: true })}
           >
             {t.label}
           </button>
@@ -211,6 +223,18 @@ export function RunPage() {
       </div>
 
       <div role="tabpanel">
+        {tab === 'verdict' && r && (
+          <Section
+            title="Verdict"
+            description={
+              isPR
+                ? 'This pull request compared with the latest run on its base branch.'
+                : 'This run compared with the run before it on the same branch.'
+            }
+          >
+            <VerdictPanel run={r} />
+          </Section>
+        )}
         {tab === 'findings' && (
           <Section
             title="Findings"
@@ -319,5 +343,61 @@ export function RunPage() {
         </p>
       )}
     </>
+  );
+}
+
+/** Where the run came from: CI, branch, commit, pull request, saved scenario. */
+function CiLine({ r }: { r: Run }) {
+  // Built from the CI job's own URL, so GitHub Enterprise and self-hosted
+  // GitLab link to the right host. Only http(s) links are rendered.
+  const ciURL = r.ci_url && /^https?:\/\//.test(r.ci_url) ? r.ci_url : '';
+  const prURL = !r.pr_number || !ciURL
+    ? ''
+    : r.ci_provider === 'github' && /\/actions\/runs\//.test(ciURL)
+      ? ciURL.replace(/\/actions\/runs\/.*$/, `/pull/${r.pr_number}`)
+      : r.ci_provider === 'gitlab' && /\/-\/pipelines\//.test(ciURL)
+        ? ciURL.replace(/\/-\/pipelines\/.*$/, `/-/merge_requests/${r.pr_number}`)
+        : '';
+  return (
+    <p className="ci-line">
+      {r.ci_provider && <span>{r.ci_provider === 'github' ? 'GitHub Actions' : r.ci_provider === 'gitlab' ? 'GitLab CI' : r.ci_provider}</span>}
+      {r.repo && <code>{r.repo}</code>}
+      {r.branch && (
+        <span>
+          branch <code>{r.branch}</code>
+          {r.base_branch && r.pr_number ? (
+            <>
+              {' '}
+              into <code>{r.base_branch}</code>
+            </>
+          ) : null}
+        </span>
+      )}
+      {r.commit_sha && (
+        <span>
+          commit <code title={r.commit_sha}>{r.commit_sha.slice(0, 7)}</code>
+        </span>
+      )}
+      {r.pr_number ? (
+        prURL ? (
+          <a href={prURL} target="_blank" rel="noreferrer">
+            {r.ci_provider === 'gitlab' ? 'merge request' : 'pull request'} #{r.pr_number}
+          </a>
+        ) : (
+          <span>pull request #{r.pr_number}</span>
+        )
+      ) : null}
+      {ciURL && (
+        <a href={ciURL} target="_blank" rel="noreferrer">
+          CI job
+        </a>
+      )}
+      {r.scenario_name && (
+        <span>
+          scenario <Link to={`/projects/${r.project_id}/scenarios`}>{r.scenario_name}</Link>
+          {r.scenario_version ? ` v${r.scenario_version}` : ''}
+        </span>
+      )}
+    </p>
   );
 }

@@ -145,3 +145,28 @@ Scope: the PayPal build of paychaos (engine, API, database, dashboard, Docker im
 - **Cross-browser.** The browser suite runs Chromium only. Layout uses widely supported CSS (grid, flex, custom properties) and no browser-specific APIs, but Firefox and Safari were not exercised.
 - **Multi-instance load.** The k6 run used one API instance. The LISTEN/NOTIFY design supports several; their combined throughput was not measured.
 - **Accessibility audit with assistive technology.** Semantics were checked in code and through Playwright's role-based queries (every workflow is driven by accessible names), not with a screen reader.
+
+## Addendum: the six "Do first" features, 10 November 2026
+
+Money at risk, problems across runs, the pull-request verdict, sandbox verification, automatic spill upload and scenarios by name. Every suite was re-run after the change.
+
+| Suite | Tests | Result |
+|---|---|---|
+| Engine (Go, race detector) | 112 | all pass; coverage 81.9% (gate 75%); `go vet`, `gofmt` clean |
+| API (Vitest, real PostgreSQL 16) | 41 | all pass; line coverage 97.1% (gate 80%) |
+| Dashboard unit (Vitest, jsdom) | 20 | all pass; TypeScript strict build clean |
+| Engine → API end to end | 3 demo clients + 3 `paychaos ci` runs | pass: money at risk recorded, problems opened then fixed by the safe run, a PR with the naive client exits 2 with "new problems", a PR with the safe client exits 0 |
+| Browser (Playwright) | 6 workflows + 3 layout checks | all pass on desktop, tablet and phone, including the verdict, problems and long CI details |
+| `verify-sandbox -upstream mock` | 7 checks | 6 match, 1 skipped (rate limit, by design) |
+
+Defects found while building them, all fixed and covered by a test:
+
+| ID | Severity | Area | Finding | Fix |
+|---|---|---|---|---|
+| QA-18 | Medium | Engine | `paychaos ... -- cmd` with a non-file output (as in tests or when wrapped) raced: the command and the logger wrote to one buffer concurrently (found by the race detector). | Outputs are serialised when a command runs; real files are passed through so a terminal stays a terminal. |
+| QA-19 | Medium | Security | A CI link (`ci.url`) sent by an ingest token was rendered as a link in the dashboard; a `javascript:` URL would have been clickable. | The API accepts only http(s) URLs (400 otherwise), and the dashboard renders only http(s) links. |
+| QA-20 | Low | Engine | The `verify-sandbox` self-test reported the expired-token check as "differs", because the built-in mock accepts any token by default. | The self-test starts the mock with strict tokens, as PayPal behaves. |
+| QA-21 | Low | Engine | `-ci -fail-on-high=false` still failed on new HIGH problems: the `-ci` default took precedence over an explicit flag. | An explicit `-fail-on-high=false` now wins; `-fail-on` wins over both. |
+| QA-22 | Low | Engine | A provider profile with an out-of-range replay or expired-token status loaded without complaint. | `LoadProfile` validates every status. |
+
+Not verified: the PayPal sandbox itself (no sandbox account in the build environment), and a real GitHub pull-request comment (tested against a fake GitHub API that checks the token, the marker and that a second run edits rather than adds).

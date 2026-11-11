@@ -65,3 +65,35 @@ export function ago(iso: string | null | undefined, now = Date.now()): string {
   const label = unit[1] === 'min' ? 'min' : unit[1] + (n === 1 ? '' : 's');
   return `${n} ${label} ago`;
 }
+
+const ZERO_DECIMAL = new Set(['JPY', 'HUF', 'TWD']);
+
+/**
+ * "1,250.00 USD" from minor units. BigInt, so large amounts stay exact; the
+ * API sends bigint columns as strings.
+ */
+export function formatMoney(amountMinor: number | string, currency: string): string {
+  let n: bigint;
+  try {
+    n = BigInt(amountMinor);
+  } catch {
+    return `? ${currency}`;
+  }
+  const neg = n < 0n;
+  const digits = (neg ? -n : n).toString();
+  const exp = ZERO_DECIMAL.has(currency) ? 0 : 2;
+  const padded = digits.padStart(exp + 1, '0');
+  const whole = padded.slice(0, padded.length - exp).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const frac = exp > 0 ? `.${padded.slice(padded.length - exp)}` : '';
+  return `${neg ? '-' : ''}${whole}${frac} ${currency}`;
+}
+
+/** Per-currency totals joined with "+": currencies are never added together. */
+export function moneyText(ts: { amount_minor: number | string; currency: string }[] | null | undefined): string {
+  return (ts ?? []).map((t) => formatMoney(t.amount_minor, t.currency)).join(' + ');
+}
+
+/** The amount of one finding or request, or '' when it carried none. */
+export function amountText(x: { amount_minor?: number | string | null; currency?: string | null }): string {
+  return x.currency && x.amount_minor !== null && x.amount_minor !== undefined ? formatMoney(x.amount_minor, x.currency) : '';
+}

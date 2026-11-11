@@ -26,4 +26,33 @@ naive_high=$(echo "$runs" | python3 -c 'import json,sys; print([r["high"] for r 
 safe_total=$(echo "$runs" | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin)["runs"] if r["name"]=="demo: safe"][0]; print(r["high"]+r["medium"]+r["low"])')
 [ "$naive_high" -gt 0 ] || { echo "naive client should have HIGH findings"; exit 1; }
 [ "$safe_total" -eq 0 ] || { echo "safe client should have no findings"; exit 1; }
+naive_money=$(echo "$runs" | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin)["runs"] if r["name"]=="demo: naive"][0]; print(len(r["money_at_risk"] or []))')
+[ "$naive_money" -gt 0 ] || { echo "naive run should have money at risk"; exit 1; }
+# The naive run opens problems; the safe run, last, exercises the same
+# operations under the same faults and so marks them fixed.
+statuses=$(curl -sf "$API/api/projects/$pid/issues?status=all" | python3 -c 'import json,sys; print(" ".join(sorted({i["status"] for i in json.load(sys.stdin)["issues"]})))')
+[ "$statuses" = "fixed" ] || { echo "after the safe run every problem should be fixed, got: $statuses"; exit 1; }
+
+# Pull-request flow: a scenario saved in the dashboard, loaded by name; a
+# clean run on main as the baseline; then two pull requests judged against it.
+curl -sf -XPOST "$API/api/projects/$pid/scenarios" -H 'content-type: application/json' \
+  -d "{\"name\":\"lost-responses\",\"config\":$(cat examples/scenarios/lost-responses.json)}" >/dev/null
+tmp=$(mktemp -d)
+echo '{"repository":{"default_branch":"main"}}' > "$tmp/push.json"
+echo '{"pull_request":{"number":7,"head":{"ref":"feature","sha":"feedface"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}' > "$tmp/pr.json"
+ci() { # event-file client expected-exit
+  local code=0
+  (cd "$tmp" && env GITHUB_ACTIONS=true GITHUB_REPOSITORY=acme/shop GITHUB_SHA=c0ffee GITHUB_REF_NAME=main GITHUB_EVENT_PATH="$tmp/$1" \
+    GITHUB_STEP_SUMMARY= PAYCHAOS_TOKEN="$token" "$OLDPWD/bin/paychaos" ci -listen 127.0.0.1:0 -upstream mock -scenario lost-responses \
+    -report-to "$API" -report report.json -pr-comment=false -- "$OLDPWD/bin/$2-client" -n 5 \
+    > "$tmp/out.txt" 2> "$tmp/err.txt") || code=$?
+  [ "$code" -eq "$3" ] || { echo "ci $1 $2: exit $code, want $3"; cat "$tmp/out.txt" "$tmp/err.txt"; exit 1; }
+  grep -q "paychaos verdict" "$tmp/out.txt" || { echo "no verdict printed"; cat "$tmp/out.txt"; exit 1; }
+}
+ci push.json safe 0
+ci pr.json naive 2
+grep -q "new problem" "$tmp/out.txt" || { echo "PR verdict should list new problems"; exit 1; }
+ci pr.json safe 0
+grep -q "No new payment-safety problems" "$tmp/out.txt" || { echo "clean PR should pass"; exit 1; }
+rm -rf "$tmp"
 echo "end-to-end OK"

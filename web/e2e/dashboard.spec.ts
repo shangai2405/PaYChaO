@@ -111,3 +111,37 @@ test('API responses carry security headers', async ({ request }) => {
   expect(res.headers()['content-security-policy']).toContain("frame-ancestors 'none'");
   expect(res.headers()['x-content-type-options']).toBe('nosniff');
 });
+
+test('money at risk, problems across runs and the pull-request verdict', async ({ page, request }) => {
+  const name = unique('verdict');
+  const { id, token } = await seedProject(request, name);
+  const main = { provider: 'github', repo: 'acme/shop', branch: 'main', default_branch: 'main', url: 'https://github.com/acme/shop/actions/runs/1' };
+  await seedRun(request, token, { name: 'main 1', startedAt: '2026-11-01T10:00:00Z', medium: 1, ci: { ...main, commit: 'aaaaaaa1' } });
+  const pr = await seedRun(request, token, {
+    name: 'pr 5', startedAt: '2026-11-02T10:00:00Z', high: 1, medium: 1, amountMinor: 125000,
+    ci: { provider: 'github', repo: 'acme/shop', branch: 'fix-retry', commit: 'bbbbbbb2', pr_number: 5, base_branch: 'main', url: 'https://github.com/acme/shop/actions/runs/2' },
+  });
+
+  // A pull-request run opens on its verdict.
+  await page.goto(`/runs/${pr}`);
+  await expect(page.getByText('1 new problem (1 high)')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'main 1' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'pull request #5' })).toHaveAttribute('href', 'https://github.com/acme/shop/pull/5');
+  await expect(page.locator('.stats').getByText('1,250.00 USD')).toBeVisible();
+  await page.getByRole('tab', { name: 'Findings' }).click();
+  await expect(page.getByText('1,250.00 USD at risk')).toBeVisible();
+
+  // The PR run did not change problem status: only main's problem is tracked.
+  await page.goto(`/projects/${id}?tab=issues`);
+  await expect(page.locator('.issues-list li')).toHaveCount(1);
+  await expect(page.locator('.issues-list').getByText('MISSING_REQUEST_ID')).toBeVisible();
+  await page.getByRole('button', { name: 'Ignore', exact: true }).click();
+  await page.getByLabel('Reason (shown to your team)').fill('sandbox only');
+  await page.getByRole('button', { name: 'Ignore problem' }).click();
+  await expect(page.getByText('No open problems')).toBeVisible();
+  await page.getByRole('button', { name: 'Ignored', exact: true }).click();
+  await expect(page.getByText(/Ignored .*: sandbox only/)).toBeVisible();
+  await page.getByRole('button', { name: 'Stop ignoring' }).click();
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await expect(page.locator('.issues-list li')).toHaveCount(1);
+});

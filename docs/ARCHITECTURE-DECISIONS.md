@@ -59,3 +59,41 @@ Short records of the decisions made in the November 2026 production review. Earl
 **Decision.** Hashed files under `/assets/` are `immutable` for a year; `index.html` is `no-cache`; unknown asset paths are 404, never the SPA shell.
 
 **Why.** Prevents the "blank page after deploy" failure and makes repeat visits instant.
+
+## ADR-10 · Money in minor units, per currency, never converted
+
+**Decision.** Amounts are stored as integer minor units (`bigint`) with an ISO currency code, parsed strictly from PayPal's decimal strings (JPY, HUF and TWD have no decimals). Totals are per currency; nothing is ever added across currencies or converted.
+
+**Why.** Floating point loses cents, and an exchange rate would put a guess inside a number people act on. The amount comes from PayPal's response when the request committed (what actually moved), otherwise from the request (what was attempted). A finding's amount is the payment it puts at risk; for an unsafe retry that is the duplicate.
+
+**Consequence.** A run in two currencies shows two totals ("50.00 USD + 3.00 EUR"). Runs stored before this change show "—", not "none".
+
+## ADR-11 · Problems are keyed by code and operation, and only the default branch moves them
+
+**Decision.** A problem's identity is `code|operation` (or `code|path` with ids removed, for requests outside the audited operations). Runs on the project's default branch (learned from CI, editable) move status: new, open, fixed, regressed. Pull-request runs never do. A problem is marked fixed only if the run sent the same operation under a fault that could have shown it; otherwise it stays open and the verdict calls it "not retested".
+
+**Why.** Without the exercised-fault rule, a run that simply did not hit the failing path would "fix" everything, and the next run would show it as regressed: noise that teaches people to ignore the tool. Keeping pull requests out of issue status means a branch experiment cannot close or reopen the team's problems.
+
+**Consequence.** A problem whose code is unknown to the trigger table is never auto-fixed; it must be fixed by a run that reports cleanly after the table learns it. Runs outside CI (no branch) still move status, so the dashboard is useful before CI is set up.
+
+## ADR-12 · The pull-request verdict is computed by the API, posted by the engine
+
+**Decision.** `GET /api/ingest/runs/:id/verdict` compares a finished run with the latest finished non-PR run on its base branch. The engine fetches it and posts or edits one pull-request comment (found by a hidden marker) with the CI job's own `GITHUB_TOKEN`.
+
+**Why.** The API has the history; the CI job has the credential. paychaos never stores a GitHub token, needs no GitHub App, and works unchanged on GitHub Enterprise (`GITHUB_API_URL`). One edited comment instead of one per push keeps the pull request readable.
+
+**Consequence.** No comment on GitLab merge requests (the verdict goes to the job log and JUnit). The `new-*` fail policies fall back to "any HIGH" when the verdict cannot be fetched, so an outage fails loudly rather than passing silently.
+
+## ADR-13 · Sandbox behaviour is measured into a profile, not hard-coded
+
+**Decision.** `paychaos verify-sandbox` measures six PayPal behaviours the mock had to guess and writes them to a versioned JSON profile; `-mock-profile` makes the mock answer the same way. Only the PayPal sandbox hosts over HTTPS are allowed, credentials come from the environment and are never written, and the rate-limit answer is not measured.
+
+**Why.** PayPal's behaviour differs by API and changes over time; a profile is evidence with a date on it, and keeps the mock deterministic for CI. Flooding the sandbox to see a 429 would be abuse of a shared service.
+
+**Consequence.** Until someone runs it against a real sandbox app, the mock's defaults remain best guesses (documented in the README).
+
+## ADR-14 · Spill files describe themselves
+
+**Decision.** A spill file starts with a header line (run id and run metadata) and ends with a finish line (final findings) when the run ended. Upload replays them through the normal idempotent ingest endpoints with batch numbers from a reserved range (1,000,000+), skips provisional findings when a finish line exists, and deletes the file only after the API stored everything. The engine uploads finished files (or files idle for 10 minutes) at start; `paychaos upload-spill` does it by hand.
+
+**Why.** A file that needs the original process's memory to be understood cannot be recovered later. Reusing the ingest endpoints means no new server code path and the same deduplication, so resending is harmless. Files from older versions (no header) are refused and kept, never guessed at.

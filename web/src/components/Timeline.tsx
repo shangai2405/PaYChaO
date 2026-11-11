@@ -1,5 +1,5 @@
 import type { Operation } from '../api';
-import { outcome } from '../format';
+import { amountText, outcome } from '../format';
 import { SeverityBadge } from './ui';
 
 /**
@@ -35,6 +35,7 @@ export function Timeline({ op }: { op: Operation }) {
               <div className="attempt-box">
                 <div className="attempt-seq">#{a.seq}</div>
                 <div className="attempt-label">{o.label}</div>
+                {amountText(a) && <div className="attempt-amount">{amountText(a)}</div>}
                 <div className="attempt-meta">
                   {a.request_id ? <code title={a.request_id}>id {a.request_id.slice(0, 8)}…</code> : <span className="warn-text">no request id</span>}
                 </div>

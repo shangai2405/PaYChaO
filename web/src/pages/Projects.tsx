@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, post, type Project } from '../api';
-import { Counts, Empty, ErrorBox, HealthBadge, healthOf, PageHeader, Section, Skeleton, useToast } from '../components/ui';
+import { Counts, Empty, ErrorBox, HealthBadge, healthOf, Money, PageHeader, Section, Skeleton, useToast } from '../components/ui';
 import { ago } from '../format';
 
 export function Projects() {
@@ -76,8 +76,14 @@ export function Projects() {
                   {p.latest ? (
                     <>
                       <Counts high={p.latest.high} medium={p.latest.medium} low={p.latest.low} />
+                      {p.latest.money_at_risk && p.latest.money_at_risk.length > 0 && (
+                        <span className="small">
+                          <Money totals={p.latest.money_at_risk} /> at risk
+                        </span>
+                      )}
                       <span className="muted small">
                         latest run {ago(p.latest.started_at)} · {p.run_count ?? 0} run{p.run_count === 1 ? '' : 's'}
+                        {p.open_issues ? ` · ${p.open_issues} open problem${p.open_issues === 1 ? '' : 's'}` : ''}
                       </span>
                     </>
                   ) : (
