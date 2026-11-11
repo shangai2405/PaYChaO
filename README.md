@@ -5,7 +5,7 @@
 
 `paychaos` is a fault-injecting proxy, written in Go, that sits between your application and the PayPal REST API (sandbox only) and breaks things the way real networks do. It lets PayPal **commit a request and then loses the response on purpose**, returns 500s for requests that went through, holds responses until clients time out, expires access tokens, and duplicates, delays and reorders webhooks. While it does that it audits how your integration reacts and reports retry patterns that would **double-capture, double-refund or double-pay out** in production, naming the duplicate resources the retry created.
 
-Around the engine sit a Node/TypeScript API, a PostgreSQL store and a React dashboard that keep run history, show findings live, track each project's health across runs, explain every finding with a fix guide, draw a retry timeline per operation, compare runs and export them for CI. The engine works on its own from the command line; the dashboard is an addition, not a dependency.
+Every finding carries the **amount it puts at risk** (read from the request and PayPal's response, per currency, never converted). Around the engine sit a Node/TypeScript API, a PostgreSQL store and a React dashboard that keep run history, show findings live, **track each problem across runs** (new, still open, fixed, regressed), **judge each pull request against its base branch** and comment the verdict on it, explain every finding with a fix guide, draw a retry timeline per operation, compare runs and export them for CI. The engine works on its own from the command line; the dashboard is an addition, not a dependency.
 
 ![Project overview: health of the latest run, findings per run, recurring problems with fix guides](docs/screenshots/project-overview.png)
 
@@ -87,11 +87,14 @@ Without Docker: start PostgreSQL 16, then `cd api && npm ci && DATABASE_URL=post
 | Page | What it is for |
 |---|---|
 | **Projects** | Every integration under test with the health of its latest run (passing, needs attention, failing). |
-| **Project → Overview** | Latest run's status, what changed since the run before (new and fixed findings), a findings-per-run chart, and the finding types that keep recurring, each linked to its fix guide. |
+| **Project → Overview** | Latest run's status, money at risk, open problems, what changed since the run before (new and fixed findings), a findings-per-run chart, and the finding types that keep recurring, each linked to its fix guide. |
+| **Project → Problems** | One row per problem however many runs saw it, with status (new, still open, fixed, regressed), when it was first and last seen, the amount at risk, and an ignore action with a reason. Status moves only with runs on the default branch; a problem is "fixed" only when a later run tried the same operation under a fault that could have shown it. |
 | **Project → Runs / Tokens** | Run history with keyset paging and two-run comparison; ingest tokens with their last use, revocable with confirmation. |
-| **Run** | Findings in plain language with an on-demand fix guide and code example, the per-operation retry timeline, webhook deliveries, the exact scenario used, and downloads as JSON, JUnit or Markdown (the same formats the engine writes). |
-| **Scenarios** | A JSON editor validated live with the engine's own rules, with unsaved-change protection. |
+| **Run** | Where it came from (CI, branch, commit, pull request, scenario and version), money at risk, the **verdict** against the base branch (new, fixed, still open, not retested; a pull-request run opens on it), findings in plain language with the amount at risk, their status across runs and an on-demand fix guide and code example, the per-operation retry timeline, webhook deliveries, the exact scenario used, and downloads as JSON, JUnit or Markdown (the same formats the engine writes). |
+| **Scenarios** | A JSON editor validated live with the engine's own rules, with unsaved-change protection. Each saved change bumps a version; the engine loads a scenario by name (`-scenario NAME`) and each run records the version it used. |
 | **Fix guides** | Every finding code: business impact, cause, the fix, and example code. |
+
+![Problems across runs: each with its status, amount at risk, first and last run, fix guide and ignore action](docs/screenshots/problems-across-runs.png)
 
 Destructive actions (delete a run, a project, a scenario; revoke a token) ask first; deleting a project requires typing its name. The layout works from phone to desktop, follows the system light/dark setting (or a manual choice), and is keyboard and screen-reader friendly. Live updates arrive over Server-Sent Events.
 
@@ -157,20 +160,44 @@ By default two requests are "the same operation" when they share account, method
 
 Requests carrying one of them are grouped by its value instead. PayPal's `invoice_id` exists for exactly this kind of reconciliation, so most integrations already send one.
 
-The process exits with status `2` when any HIGH finding exists, so it can gate a CI job (`-fail-on-high=false` to disable). A live JSON report is served at `GET /__paychaos/report`.
+Each audited request records the amount it moves (purchase units for orders, `amount` for captures of authorizations and refunds, items for payouts), replaced by the amount in PayPal's response when the request committed. Findings carry the amount they put at risk, and reports total it per currency.
+
+The process exits with status `2` when any HIGH finding exists, so it can gate a CI job (`-fail-on none` or `-fail-on-high=false` to disable; see [CI integration](#ci-integration) for the other policies). A live JSON report is served at `GET /__paychaos/report`.
 
 ## CI integration
+
+### With the dashboard: `paychaos ci`
+
+```bash
+PAYCHAOS_TOKEN=pct_... GITHUB_TOKEN=... \
+  paychaos ci -upstream mock -scenario checkout-strict -seed 7 -report-to https://paychaos.example -- make integration-test
+```
+
+- Reads the branch, commit, pull request and base branch from GitHub Actions or GitLab CI (standard variables and the GitHub event file only).
+- Runs the command after `--` with `PAYCHAOS_PROXY_URL` set to the proxy; its own exit status does not decide the result, since injected faults often fail tests on purpose.
+- Prints the **verdict**: this run compared with the latest finished run on the base branch (or, on a branch push, the previous run of the branch). Problems are *new*, *fixed*, *still open* or *not retested* (open before, but this run never tried that operation under a fault that could show it, so it cannot claim a fix). Money newly at risk is totalled per currency.
+- Appends the verdict to the job summary (`$GITHUB_STEP_SUMMARY`, or `-markdown FILE`).
+- On a GitHub pull request, creates **one** comment with the verdict and edits it on every later push. It uses the job's own `GITHUB_TOKEN` (grant `pull-requests: write`); paychaos never stores a GitHub credential. `-pr-comment=false` turns it off.
+- `-fail-on` decides the exit status: `new-high` (default with `ci`: a HIGH problem the base branch did not have), `new-any`, `high` (any HIGH finding) or `none`. If the verdict cannot be fetched, the `new-*` policies fall back to `high` rather than pass silently.
+
+[`examples/ci/github-actions.yml`](examples/ci/github-actions.yml) and [`examples/ci/gitlab-ci.yml`](examples/ci/gitlab-ci.yml) are complete pipelines.
+
+![A pull-request run's verdict: 6 new problems, 33.02 USD newly at risk, compared with the latest run on main](docs/screenshots/pr-verdict.png)
+
+If the dashboard is unreachable during a run, events are saved to `paychaos-spill-<run>.ndjson` (a header line identifies the run, a finish line records the final findings). The next run that has `-report-to` uploads finished files before it starts and deletes them once stored; `paychaos upload-spill -report-to URL [FILE...]` does it by hand. Uploads reuse the run id and numbered batches, so sending a file twice stores nothing twice.
+
+### Without a dashboard
 
 ```bash
 paychaos -config paychaos.json -junit paychaos-junit.xml -markdown "$GITHUB_STEP_SUMMARY"
 paychaos compare -fail-on medium baseline.json current.json
 ```
 
-- `-junit FILE` writes one failing test case per finding, so CI test reporters show findings next to ordinary test results.
-- `-markdown FILE` appends a summary table, suited to `$GITHUB_STEP_SUMMARY`.
+- `-junit FILE` writes one failing test case per finding (with the amount at risk), so CI test reporters show findings next to ordinary test results.
+- `-markdown FILE` appends a summary table with the money at risk, suited to `$GITHUB_STEP_SUMMARY`.
 - `paychaos compare` fails only on findings a change introduces. Findings are grouped by code, severity and path and counted, because request numbers and resource ids differ between runs. Both runs should use the same seed, scenario and workload. The dashboard's compare view uses the same rule.
 
-[`examples/ci/github-actions.yml`](examples/ci/github-actions.yml) is a complete workflow that builds a baseline on the base branch and compares the pull request against it.
+[`examples/ci/github-actions-files-only.yml`](examples/ci/github-actions-files-only.yml) builds a baseline on the base branch and compares the pull request against it.
 
 ## PayPal behaviour that is modelled
 
@@ -183,15 +210,25 @@ From PayPal's idempotency, Orders and webhooks documentation:
 - **Capturing a captured order is `422 ORDER_ALREADY_CAPTURED`;** PayPal's advice is to GET the order.
 - **Success codes:** capture returns 201, authorization 200. "Committed" means any 2xx.
 
-### To verify in the sandbox
+### Checking these against the real sandbox: `paychaos verify-sandbox`
 
-These are modelled on a best guess and should be checked against `api-m.sandbox.paypal.com` before relying on them:
+Some of the above is documented and some is a best guess. `verify-sandbox` measures it against your own sandbox app and writes a provider profile:
 
-- whether create-order without `PayPal-Request-Id` is rejected with 400 when a payment source is included (a community report says so; not modelled);
-- that two partial refunds of one capture without a request id both succeed (the mock assumes so; it is the clearest double-money case);
-- where the capture id sits in the capture-order response (the proxy reads `purchase_units[].payments.captures[]`, falling back to the top-level id);
-- the exact body and status PayPal returns for an expired token and for a rate limit;
-- whether a same-id capture retry answers 201 or 200 (the mock answers with the original status).
+```bash
+PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... paychaos verify-sandbox     # writes paypal.profile.json
+paychaos -upstream mock -mock-profile paypal.profile.json ...            # the mock now answers like the sandbox did
+```
+
+It talks only to `api-m.sandbox.paypal.com` / `api.sandbox.paypal.com` over HTTPS and refuses any other host. Credentials come from the environment and are never written anywhere. It creates one order and asks you to approve it as a sandbox buyer (it prints the approval link and waits), then checks, printing *matches*, *differs* or *failed* for each:
+
+1. whether create-order with a payment source and no `PayPal-Request-Id` is accepted;
+2. where the capture id sits in the capture-order response;
+3. what a same-id capture retry answers (201 or 200, same capture);
+4. capturing the captured order with a new id (`422 ORDER_ALREADY_CAPTURED`?);
+5. two partial refunds of one capture without a request id;
+6. the answer to an invalid access token.
+
+The rate-limit answer is not measured: provoking it would mean flooding the sandbox. `paychaos verify-sandbox -upstream mock` runs the same checks against the built-in mock as a self-test. **These checks have not yet been run against the real sandbox from this repository** (it needs a sandbox account); the profile format and the mock's use of it are tested.
 
 ## Architecture
 
@@ -265,10 +302,10 @@ The bugs `paychaos` targets live in:
 | Suite | Command | What it covers |
 |---|---|---|
 | Engine | `make vet test cover` | Go unit and end-to-end tests with the race detector; coverage gate at 75% (currently 84%). |
-| API | `cd api && TEST_DATABASE_URL=postgres://… npm run test:coverage` | 30 tests against a real PostgreSQL: ingest idempotency, pagination, health, export, security headers, rate limiting, startup checks, static serving. Gate at 80% of lines (currently 96%). |
-| Dashboard | `cd web && npm test` | Components, fix-guide coverage of every engine finding code, chart, confirmation dialog. |
-| Engine → API | `DATABASE_URL=… ./scripts/e2e.sh` | The three demo clients streamed through the engine into the real API. |
-| Browser | `DATABASE_URL=… ./scripts/ui-e2e.sh` | Playwright: create project and token, revoke, health and trend, compare, run detail, fix guide, export download, delete with confirmation, scenario editor; no sideways scrolling on phone, tablet and desktop. |
+| API | `cd api && TEST_DATABASE_URL=postgres://… npm run test:coverage` | 41 tests against a real PostgreSQL: ingest idempotency, pagination, health, export, security headers, rate limiting, startup checks, static serving, money totals, issue tracking across runs, pull-request verdicts, scenarios by name. Gate at 80% of lines (currently 96%). |
+| Dashboard | `cd web && npm test` | Components, fix-guide coverage of every engine finding code, chart, confirmation dialog, money formatting, verdict panel. |
+| Engine → API | `DATABASE_URL=… ./scripts/e2e.sh` | The three demo clients streamed through the engine into the real API; money at risk and problem status; then `paychaos ci` with a scenario loaded by name, a baseline on `main` and two pull requests (one failing with new problems, one passing). |
+| Browser | `DATABASE_URL=… ./scripts/ui-e2e.sh` | Playwright: create project and token, revoke, health and trend, compare, run detail, fix guide, export download, delete with confirmation, scenario editor, pull-request verdict, money at risk, problems tab with ignore and restore; no sideways scrolling on phone, tablet and desktop. |
 | Load | `k6 run load/ingest.js` | See [Load testing](#load-testing). |
 
 CI runs all of these plus a Docker image build that checks the container refuses an unsafe configuration and serves with a token. [docs/QA-REPORT.md](docs/QA-REPORT.md) records the defects found and fixed in the last review.
@@ -276,7 +313,8 @@ CI runs all of these plus a Docker image build that checks the container refuses
 ## Layout
 
 ```
-cmd/paychaos/            CLI: proxy, webhook relay, mock, scenario tools, compare
+cmd/paychaos/            CLI: proxy, webhook relay, mock, scenario tools, compare, ci, verify-sandbox, upload-spill
+internal/money/          amounts in minor units from PayPal request and response bodies
 internal/chaos/          rule engine, seeded streams, scenario loading
 internal/proxy/          reverse proxy, sandbox allowlist, token passthrough, faults, connection reset
 internal/audit/          JSON canonicalisation, operation grouping, retry-safety findings
