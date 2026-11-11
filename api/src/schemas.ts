@@ -24,6 +24,7 @@ const isoDate = z.string().datetime({ offset: true });
 const optionalIsoDate = isoDate.transform((v) => (v.startsWith('0001-01-01') ? null : v));
 
 export const uuid = z.string().uuid();
+const currency = z.string().regex(/^[A-Z]{3}$/);
 
 export const recordSchema = z.object({
   seq: z.number().int().positive(),
@@ -41,6 +42,8 @@ export const recordSchema = z.object({
   object_id: z.string().max(200).optional().default(''),
   committed: z.boolean().optional().default(false),
   response_delivered: z.boolean().optional().default(false),
+  amount_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  currency: currency.optional(),
 });
 export type RecordIn = z.infer<typeof recordSchema>;
 
@@ -54,6 +57,8 @@ export const findingSchema = z.object({
   requests: z.array(z.number().int()).max(1000).nullable().optional().transform((v) => v ?? []),
   object_ids: z.array(z.string().max(200)).max(1000).nullable().optional().transform((v) => v ?? []),
   at: isoDate,
+  amount_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  currency: currency.optional(),
 });
 export type FindingIn = z.infer<typeof findingSchema>;
 
@@ -87,7 +92,22 @@ export const runMetaSchema = z.object({
   scenario: z.unknown().optional().default({}),
   started_at: isoDate,
   engine_version: z.string().max(100).optional().default(''),
+  scenario_name: z.string().max(100).optional().default(''),
+  scenario_version: z.number().int().positive().optional(),
+  ci: z
+    .object({
+      provider: z.string().max(40).optional().default(''),
+      repo: z.string().max(200).optional().default(''),
+      branch: z.string().max(200).optional().default(''),
+      commit: z.string().max(64).optional().default(''),
+      pr_number: z.number().int().positive().optional(),
+      base_branch: z.string().max(200).optional().default(''),
+      default_branch: z.string().max(200).optional().default(''),
+      url: z.string().max(500).regex(/^(https?:\/\/.*)?$/, 'must be an http(s) URL').optional().default(''),
+    })
+    .optional(),
 });
+export type RunMetaIn = z.infer<typeof runMetaSchema>;
 
 export const webhookSummarySchema = z.object({
   event_id: z.string(),
@@ -150,10 +170,19 @@ export const projectBodySchema = z.object({
   description: z.string().trim().max(500).optional().default(''),
 });
 export const projectPatchSchema = z
-  .object({ name: z.string().trim().min(1).max(100), description: z.string().trim().max(500) })
+  .object({
+    name: z.string().trim().min(1).max(100),
+    description: z.string().trim().max(500),
+    default_branch: z.string().trim().max(200),
+  })
   .partial()
   .strict()
-  .refine((v) => v.name !== undefined || v.description !== undefined, { message: 'nothing to update' });
+  .refine((v) => v.name !== undefined || v.description !== undefined || v.default_branch !== undefined, {
+    message: 'nothing to update',
+  });
+export const issuePatchSchema = z
+  .object({ ignored: z.boolean(), reason: z.string().trim().max(500).optional().default('') })
+  .strict();
 export const tokenBodySchema = z.object({ label: z.string().trim().max(100).optional().default('') });
 
 export const listQuerySchema = z.object({

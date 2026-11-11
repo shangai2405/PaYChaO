@@ -161,11 +161,17 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	return ParseConfig(path, b)
+}
+
+// ParseConfig parses a JSON scenario; name labels errors (a file path, or a
+// scenario name loaded from the API).
+func ParseConfig(name string, b []byte) (Config, error) {
 	var c Config
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+		return Config{}, fmt.Errorf("parse %s: %w", name, err)
 	}
 	if len(c.MutatingPaths) == 0 {
 		c.MutatingPaths = DefaultMutatingPaths

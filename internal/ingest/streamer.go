@@ -51,6 +51,24 @@ type RunMeta struct {
 	Scenario  json.RawMessage `json:"scenario"`
 	StartedAt time.Time       `json:"started_at"`
 	Version   string          `json:"engine_version"`
+	// ScenarioName and ScenarioVersion are set when the scenario was loaded
+	// by name from the API (-scenario).
+	ScenarioName    string `json:"scenario_name,omitempty"`
+	ScenarioVersion int    `json:"scenario_version,omitempty"`
+	// CI describes where the run came from (paychaos ci).
+	CI *CI `json:"ci,omitempty"`
+}
+
+// CI is what a CI system tells us about the code under test.
+type CI struct {
+	Provider      string `json:"provider"`
+	Repo          string `json:"repo,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	Commit        string `json:"commit,omitempty"`
+	PRNumber      int    `json:"pr_number,omitempty"`
+	BaseBranch    string `json:"base_branch,omitempty"`
+	DefaultBranch string `json:"default_branch,omitempty"`
+	URL           string `json:"url,omitempty"`
 }
 
 // Finish is sent once, when the run ends. Its findings replace any streamed
@@ -352,13 +370,9 @@ func (s *Streamer) spillEvents(evs []Event) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.spill == nil {
-		f, err := os.OpenFile(s.opt.SpillPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			s.opt.Logger.Error("cannot open spill file; events dropped", "err", err, "count", len(evs))
-			return
-		}
-		s.spill = f
+	if !s.openSpill() {
+		s.opt.Logger.Error("cannot open spill file; events dropped", "count", len(evs))
+		return
 	}
 	enc := json.NewEncoder(s.spill)
 	for i := range evs {
@@ -366,6 +380,24 @@ func (s *Streamer) spillEvents(evs []Event) {
 			s.stats.Spilled++
 		}
 	}
+}
+
+// openSpill opens the spill file on first use and writes its header line:
+// the run's id and metadata, so the file can be uploaded later on its own
+// (see UploadSpill). Called with s.mu held.
+func (s *Streamer) openSpill() bool {
+	if s.spill != nil {
+		return true
+	}
+	f, err := os.OpenFile(s.opt.SpillPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		s.opt.Logger.Error("cannot open spill file", "err", err)
+		return false
+	}
+	s.spill = f
+	meta := s.meta
+	_ = json.NewEncoder(f).Encode(spillLine{Kind: "run", RunID: s.opt.RunID, Run: &meta})
+	return true
 }
 
 // Close stops accepting events, sends what is queued and the finish message,
@@ -396,6 +428,11 @@ func (s *Streamer) Close(ctx context.Context, fin Finish) (Stats, error) {
 			}
 		}
 		s.mu.Lock()
+		// Whatever did not reach the API is in the spill file; add the
+		// finish so a later upload (UploadSpill) can complete the run.
+		if (s.spill != nil || err != nil) && started && s.openSpill() {
+			_ = json.NewEncoder(s.spill).Encode(spillLine{Kind: "finish", RunID: s.opt.RunID, Finish: &fin})
+		}
 		if s.spill != nil {
 			_ = s.spill.Close()
 		}

@@ -176,6 +176,9 @@ func TestNaiveRetryDuplicates(t *testing.T) {
 	if f == nil || f.Severity != audit.High || len(f.ObjectIDs) != 2 || f.ObjectIDs[0] == f.ObjectIDs[1] || f.Operation != "create_order" {
 		t.Fatalf("want HIGH naming both orders, got %+v", h.auditor.Findings())
 	}
+	if f.Currency != "USD" || f.AmountMinor != 5000 {
+		t.Fatalf("money at risk = %d %s, want 5000 USD", f.AmountMinor, f.Currency)
+	}
 }
 
 // With a stable PayPal-Request-Id the retry gets the existing order back.
@@ -242,6 +245,28 @@ func TestNaiveRefundRetryRefundsTwice(t *testing.T) {
 	if f == nil || f.Operation != "refund_capture" || !strings.Contains(f.Message, "duplicate refund") {
 		t.Fatalf("want a duplicate-refund finding, got %+v", h.auditor.Findings())
 	}
+	if f.Currency != "USD" || f.AmountMinor != 1000 {
+		t.Fatalf("money at risk = %d %s, want the refunded 1000 USD", f.AmountMinor, f.Currency)
+	}
+}
+
+// An order capture carries no amount in its request; the amount at risk is
+// read from the capture in the (lost) response.
+func TestCaptureAmountComesFromResponse(t *testing.T) {
+	h := newHarness(t, rule("drop-capture", "/v2/checkout/orders/", chaos.FaultDropAfterCommit))
+	r, _ := createOrder(t, h.upstream.URL, "tok", "")
+	id := r.body["id"].(string)
+	if _, err := call(t, http.MethodPost, h.proxy.URL+"/v2/checkout/orders/"+id+"/capture", "tok", "", nil); err == nil {
+		t.Fatal("capture should lose its response")
+	}
+	f := finding(h.auditor.Findings(), audit.CodeUnreconciled)
+	if f == nil || f.Currency != "USD" || f.AmountMinor != 5000 {
+		t.Fatalf("want 50.00 USD at risk on %s, got %+v", audit.CodeUnreconciled, h.auditor.Findings())
+	}
+	recs := h.auditor.Records()
+	if len(recs) != 1 || recs[0].AmountMinor != 5000 || recs[0].Currency != "USD" {
+		t.Fatalf("record amount: %+v", recs)
+	}
 }
 
 // Capture response lost; a retry without the request id gets 422
@@ -272,6 +297,9 @@ func TestCaptureRetryAlreadyCaptured(t *testing.T) {
 			}
 			if !fetch && (got == nil || got.Severity != audit.Medium) {
 				t.Fatalf("want %s, got %+v", audit.CodeAlreadyCaptured, fs)
+			}
+			if !fetch && (got.Currency != "USD" || got.AmountMinor != 5000) {
+				t.Fatalf("already-captured finding should carry the captured 50.00 USD, got %+v", got)
 			}
 			if h.mock.Created("captures") != 1 {
 				t.Fatal("PayPal blocks a second capture of one order")

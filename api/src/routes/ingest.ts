@@ -6,6 +6,9 @@ import type { FastifyRequest } from 'fastify';
 import { tx } from '../db.js';
 import { HttpError, notFound } from '../errors.js';
 import { notify } from '../events.js';
+import { applyIssues, issueKey } from '../issues.js';
+import { totals } from '../money.js';
+import { verdictFor } from '../verdict.js';
 import {
   batchSchema,
   finishSchema,
@@ -40,15 +43,17 @@ async function insertRequests(q: pg.ClientBase, runId: string, recs: RecordIn[])
   const rs = [...latest.values()];
   await q.query(
     `INSERT INTO requests (run_id, seq, at, done, method, path, operation, request_id, fingerprint, rule,
-                           fault, upstream_status, issue, object_id, committed, response_delivered)
+                           fault, upstream_status, issue, object_id, committed, response_delivered, amount_minor, currency)
      SELECT $1::uuid, * FROM unnest($2::int[], $3::timestamptz[], $4::timestamptz[], $5::text[], $6::text[], $7::text[],
                               $8::text[], $9::text[], $10::text[], $11::text[], $12::int[], $13::text[], $14::text[],
-                              $15::bool[], $16::bool[])
+                              $15::bool[], $16::bool[], $17::bigint[], $18::text[])
      ON CONFLICT (run_id, seq) DO UPDATE SET
        done = EXCLUDED.done, rule = EXCLUDED.rule, fault = EXCLUDED.fault,
        upstream_status = EXCLUDED.upstream_status, issue = EXCLUDED.issue, object_id = EXCLUDED.object_id,
        committed = EXCLUDED.committed,
-       response_delivered = requests.response_delivered OR EXCLUDED.response_delivered`,
+       response_delivered = requests.response_delivered OR EXCLUDED.response_delivered,
+       amount_minor = coalesce(EXCLUDED.amount_minor, requests.amount_minor),
+       currency = coalesce(EXCLUDED.currency, requests.currency)`,
     [
       runId,
       rs.map((r) => r.seq),
@@ -66,6 +71,8 @@ async function insertRequests(q: pg.ClientBase, runId: string, recs: RecordIn[])
       rs.map((r) => r.object_id),
       rs.map((r) => r.committed),
       rs.map((r) => r.response_delivered),
+      rs.map((r) => (r.currency ? (r.amount_minor ?? null) : null)),
+      rs.map((r) => (r.amount_minor !== undefined ? (r.currency ?? null) : null)),
     ],
   );
 }
@@ -74,14 +81,28 @@ async function insertRequests(q: pg.ClientBase, runId: string, recs: RecordIn[])
 async function insertFindings(q: pg.ClientBase, runId: string, fs: FindingIn[], final: boolean): Promise<void> {
   if (fs.length === 0) return;
   await q.query(
-    `INSERT INTO findings (run_id, code, severity, message, path, operation, fingerprint, requests, object_ids, at, final)
+    `INSERT INTO findings (run_id, code, severity, message, path, operation, fingerprint, requests, object_ids, at, final,
+                           amount_minor, currency, issue_key)
      SELECT $1::uuid, f.code, f.severity, f.message, f.path, f.operation, f.fingerprint,
             ARRAY(SELECT jsonb_array_elements_text(f.requests)::int),
             ARRAY(SELECT jsonb_array_elements_text(f.object_ids)),
-            f.at, $3::boolean
+            f.at, $3::boolean, f.amount_minor, f.currency, f.issue_key
      FROM jsonb_to_recordset($2::jsonb) AS f(code text, severity text, message text, path text, operation text,
-                                             fingerprint text, requests jsonb, object_ids jsonb, at timestamptz)`,
-    [runId, JSON.stringify(fs), final],
+                                             fingerprint text, requests jsonb, object_ids jsonb, at timestamptz,
+                                             amount_minor bigint, currency text, issue_key text)`,
+    [
+      runId,
+      JSON.stringify(
+        fs.map((f) => ({
+          ...f,
+          // An amount needs its currency and vice versa.
+          amount_minor: f.currency ? (f.amount_minor ?? null) : null,
+          currency: f.amount_minor !== undefined ? (f.currency ?? null) : null,
+          issue_key: issueKey(f),
+        })),
+      ),
+      final,
+    ],
   );
 }
 
@@ -114,11 +135,20 @@ export async function ingestRoutes(app: FastifyInstance, pool: pg.Pool, limiter:
     const runId = uuid.parse(req.params.id);
     const meta = runMetaSchema.parse(req.body);
     const created = await tx(pool, async (c) => {
+      const ci = meta.ci;
       const { rowCount } = await c.query(
-        `INSERT INTO runs (id, project_id, name, seed, upstream, scenario, engine_version, started_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
-        [runId, projectId, meta.name, meta.seed, meta.upstream, JSON.stringify(meta.scenario ?? {}), meta.engine_version, meta.started_at],
+        `INSERT INTO runs (id, project_id, name, seed, upstream, scenario, engine_version, started_at,
+                           scenario_name, scenario_version, ci_provider, repo, branch, commit_sha, pr_number, base_branch, ci_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (id) DO NOTHING`,
+        [runId, projectId, meta.name, meta.seed, meta.upstream, JSON.stringify(meta.scenario ?? {}), meta.engine_version,
+          meta.started_at, meta.scenario_name, meta.scenario_version ?? null, ci?.provider ?? '', ci?.repo ?? '',
+          ci?.branch ?? '', ci?.commit ?? '', ci?.pr_number ?? null, ci?.base_branch ?? '', ci?.url ?? ''],
       );
+      // The first CI run that knows the repository's default branch teaches it
+      // to the project; an admin can change it later.
+      if (ci?.default_branch) {
+        await c.query(`UPDATE projects SET default_branch = $2 WHERE id = $1 AND default_branch = ''`, [projectId, ci.default_branch]);
+      }
       if (rowCount === 0) {
         await ownRun(c, runId, projectId); // a retry is fine; another project's id is not
         return false;
@@ -175,14 +205,33 @@ export async function ingestRoutes(app: FastifyInstance, pool: pg.Pool, limiter:
       await insertFindings(c, runId, fin.findings, true);
       const { rowCount } = await c.query(
         `UPDATE runs SET status = 'finished', finished_at = $2, request_count = $3, high = $4, medium = $5, low = $6,
-                faults_applied = $7, webhooks = $8, webhook_notes = $9
+                faults_applied = $7, webhooks = $8, webhook_notes = $9, money_at_risk = $10
          WHERE id = $1`,
         [runId, fin.finished_at, fin.request_count, count('HIGH'), count('MEDIUM'), count('LOW'),
-          JSON.stringify(fin.faults_applied), JSON.stringify(fin.webhooks), JSON.stringify(fin.webhook_notes)],
+          JSON.stringify(fin.faults_applied), JSON.stringify(fin.webhooks), JSON.stringify(fin.webhook_notes),
+          JSON.stringify(totals(fin.findings))],
       );
       if (rowCount !== 1) throw new HttpError(500, 'run vanished');
+      await applyIssues(c, runId, fin.findings);
       await notify(c, { type: 'run.finished', run_id: runId, project_id: projectId, findings: fin.findings.length });
     });
     return { run_id: runId, status: 'finished' };
+  });
+
+  // The pull-request verdict, for `paychaos ci`, which holds only an ingest token.
+  app.get<{ Params: { id: string } }>('/api/ingest/runs/:id/verdict', async (req) => {
+    const projectId = await projectForToken(pool, req);
+    return verdictFor(pool, uuid.parse(req.params.id), projectId);
+  });
+
+  // `paychaos -scenario NAME` loads a saved scenario of the token's project.
+  app.get<{ Params: { name: string } }>('/api/ingest/scenarios/:name', async (req) => {
+    const projectId = await projectForToken(pool, req);
+    const { rows } = await pool.query(
+      'SELECT name, version, config, updated_at FROM scenarios WHERE project_id = $1 AND name = $2',
+      [projectId, req.params.name],
+    );
+    if (!rows[0]) throw notFound('scenario');
+    return rows[0];
   });
 }

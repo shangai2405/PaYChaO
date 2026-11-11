@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/shangai2405/paychaos/internal/chaos"
+	"github.com/shangai2405/paychaos/internal/money"
 )
 
 // RequestIDHeader is the header PayPal reads for idempotency on POST calls.
@@ -83,6 +84,23 @@ type Finding struct {
 	Requests    []int     `json:"requests"`
 	ObjectIDs   []string  `json:"object_ids,omitempty"`
 	At          time.Time `json:"at"`
+	// AmountMinor and Currency are the money this finding puts at risk: the
+	// amount moved twice, or moved while the client believes it failed.
+	// Unset when the finding moves no money or the amount is unknown.
+	AmountMinor int64  `json:"amount_minor,omitempty"`
+	Currency    string `json:"currency,omitempty"`
+}
+
+// Amount returns the money at risk as an amount.
+func (f Finding) Amount() money.Amount {
+	return money.Amount{Minor: f.AmountMinor, Currency: f.Currency}
+}
+
+func (f Finding) withAmount(a money.Amount) Finding {
+	if a.Known() {
+		f.AmountMinor, f.Currency = a.Minor, a.Currency
+	}
+	return f
 }
 
 // Record is one request seen by the proxy.
@@ -110,6 +128,10 @@ type Record struct {
 	// Committed is true when the upstream processed the request successfully,
 	// whether or not the client received the response.
 	Committed bool `json:"committed"`
+	// AmountMinor and Currency are the money the request moves: from the
+	// upstream's response when it committed, otherwise from the request body.
+	AmountMinor int64  `json:"amount_minor,omitempty"`
+	Currency    string `json:"currency,omitempty"`
 
 	// lostOriginal is the seq of an earlier committed attempt whose response
 	// was lost and which this request retries without the original id. The
@@ -117,6 +139,11 @@ type Record struct {
 	lostOriginal int
 	// tick orders this record against observed GETs.
 	tick int
+}
+
+// Amount returns the money the request moves.
+func (r Record) Amount() money.Amount {
+	return money.Amount{Minor: r.AmountMinor, Currency: r.Currency}
 }
 
 // Outcome is what happened to a request, reported by the proxy.
@@ -127,6 +154,8 @@ type Outcome struct {
 	Committed      bool
 	ObjectID       string
 	Issue          string
+	// Amount is what the upstream's response says was moved, if it says.
+	Amount money.Amount
 }
 
 // Hooks are called, under the auditor's lock, as records complete and findings
@@ -428,16 +457,17 @@ func (a *Auditor) BeginRequest(account, method, path, contentType, requestID str
 	if k, ok := OperationKey(account, method, path, contentType, body, a.opParams); ok {
 		fp = k
 	}
-	return a.begin(method, path, requestID, fp, bodyHash)
+	amt, _ := money.FromRequest(Operation(method, path), body)
+	return a.begin(method, path, requestID, fp, bodyHash, amt)
 }
 
 // Begin records an arriving request identified by fp, runs the checks that
 // depend on earlier attempts, and returns a sequence number for Complete.
 func (a *Auditor) Begin(method, path, requestID, fp string) int {
-	return a.begin(method, path, requestID, fp, fp)
+	return a.begin(method, path, requestID, fp, fp, money.Amount{})
 }
 
-func (a *Auditor) begin(method, path, reqID, fp, bodyHash string) int {
+func (a *Auditor) begin(method, path, reqID, fp, bodyHash string, amt money.Amount) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -446,7 +476,8 @@ func (a *Auditor) begin(method, path, reqID, fp, bodyHash string) int {
 	a.lastSeq++
 	seq := a.lastSeq
 	op := Operation(method, path)
-	rec := Record{Seq: seq, At: now, Method: method, Path: path, Operation: op, RequestID: reqID, Fingerprint: fp, tick: a.tick}
+	rec := Record{Seq: seq, At: now, Method: method, Path: path, Operation: op, RequestID: reqID, Fingerprint: fp, tick: a.tick,
+		AmountMinor: amt.Minor, Currency: amt.Currency}
 
 	switch {
 	case reqID == "" && hasPrefix(a.requestID, path):
@@ -711,6 +742,9 @@ func (a *Auditor) CompleteWith(seq int, o Outcome) {
 	r.Committed = o.Committed
 	r.ObjectID = o.ObjectID
 	r.Issue = o.Issue
+	if o.Committed && o.Amount.Known() {
+		r.AmountMinor, r.Currency = o.Amount.Minor, o.Amount.Currency
+	}
 	defer func() {
 		if a.hooks.OnRecord != nil {
 			a.hooks.OnRecord(*r)
@@ -742,7 +776,7 @@ func (a *Auditor) CompleteWith(seq int, o Outcome) {
 			Requests: []int{orig.Seq, r.Seq}, ObjectIDs: ids, At: r.Done,
 			Message: fmt.Sprintf("request #%d succeeded upstream but its response was lost; retry #%d used %s and also succeeded, so %s for one operation (duplicate %s)",
 				orig.Seq, r.Seq, idDesc(r.RequestID, orig.RequestID), created, duplicateWhat(r.Operation)),
-		}, fmt.Sprintf("%s-%d", CodeUnsafeRetry, orig.Seq))
+		}.withAmount(firstKnown(r.Amount(), orig.Amount())), fmt.Sprintf("%s-%d", CodeUnsafeRetry, orig.Seq))
 		// One duplicate has now happened; later retries are judged afresh.
 		a.resolved[orig.Seq] = true
 		return
@@ -757,7 +791,7 @@ func (a *Auditor) CompleteWith(seq int, o Outcome) {
 		Requests: []int{orig.Seq, r.Seq}, ObjectIDs: ids, At: r.Done,
 		Message: fmt.Sprintf("request #%d succeeded upstream but its response was lost; retry #%d used %s. It failed this time (status %d), but had it succeeded it would have created a duplicate",
 			orig.Seq, r.Seq, idDesc(r.RequestID, orig.RequestID), o.UpstreamStatus),
-	}, fmt.Sprintf("%s-%d-%d", CodeWouldDuplicate, orig.Seq, r.Seq))
+	}.withAmount(firstKnown(orig.Amount(), r.Amount())), fmt.Sprintf("%s-%d-%d", CodeWouldDuplicate, orig.Seq, r.Seq))
 }
 
 func duplicateWhat(op string) string {
@@ -847,16 +881,20 @@ func (a *Auditor) alreadyDoneIn(recs []*Record) []Finding {
 		}
 		reqs := []int{r.Seq}
 		lost := ""
+		amt := r.Amount()
 		if r.lostOriginal != 0 {
 			reqs = []int{r.lostOriginal, r.Seq}
 			lost = fmt.Sprintf("request #%d was performed upstream but its response was lost; ", r.lostOriginal)
+			if orig, ok := a.records[r.lostOriginal]; ok {
+				amt = firstKnown(orig.Amount(), amt)
+			}
 		}
 		out = append(out, Finding{
 			Code: CodeAlreadyCaptured, Severity: Medium, Path: r.Path, Operation: r.Operation, Fingerprint: r.Fingerprint,
 			Requests: reqs, At: r.Done,
 			Message: fmt.Sprintf("%sretry #%d got 422 %s and the client never fetched %s to read the result. PayPal blocked the duplicate, but the client likely recorded a failure for a payment that succeeded",
 				lost, r.Seq, r.Issue, nonBlank(res, "the resource")),
-		})
+		}.withAmount(amt))
 	}
 	return out
 }
@@ -901,7 +939,7 @@ func (a *Auditor) unreconciledIn(recs []*Record) []Finding {
 			Requests: []int{r.Seq}, ObjectIDs: nonEmpty(r.ObjectID), At: r.Done,
 			Message: fmt.Sprintf("request #%d was performed upstream%s, but the client got %s and never retried; it likely recorded a failure for an operation that succeeded. Reconcile via webhooks or by retrieving the resource",
 				r.Seq, objSuffix(r.ObjectID), lostHow(r.Fault)),
-		})
+		}.withAmount(r.Amount()))
 	}
 	return out
 }
@@ -967,4 +1005,13 @@ func (a *Auditor) Records() []Record {
 		out[i] = *r
 	}
 	return out
+}
+
+func firstKnown(as ...money.Amount) money.Amount {
+	for _, a := range as {
+		if a.Known() {
+			return a
+		}
+	}
+	return money.Amount{}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/shangai2405/paychaos/internal/audit"
 	"github.com/shangai2405/paychaos/internal/chaos"
+	"github.com/shangai2405/paychaos/internal/money"
 	"github.com/shangai2405/paychaos/internal/webhook"
 )
 
@@ -30,6 +31,57 @@ type Report struct {
 	Webhooks        []webhook.EventSummary `json:"webhooks,omitempty"`
 	WebhookNotes    []string               `json:"webhook_notes,omitempty"`
 	FaultsApplied   map[chaos.Fault]int    `json:"faults_applied"`
+	// MoneyAtRisk totals the findings' amounts per currency.
+	MoneyAtRisk []MoneyTotal `json:"money_at_risk"`
+}
+
+// MoneyTotal is the money at risk in one currency.
+type MoneyTotal struct {
+	Currency    string `json:"currency"`
+	AmountMinor int64  `json:"amount_minor"`
+	Findings    int    `json:"findings"`
+}
+
+// String renders the total, e.g. "1,250.00 USD".
+func (t MoneyTotal) String() string {
+	return money.Format(money.Amount{Minor: t.AmountMinor, Currency: t.Currency})
+}
+
+// AtRisk totals findings' amounts per currency, largest first.
+func AtRisk(fs []audit.Finding) []MoneyTotal {
+	by := map[string]*MoneyTotal{}
+	for _, f := range fs {
+		if f.Currency == "" {
+			continue
+		}
+		t := by[f.Currency]
+		if t == nil {
+			t = &MoneyTotal{Currency: f.Currency}
+			by[f.Currency] = t
+		}
+		t.AmountMinor += f.AmountMinor
+		t.Findings++
+	}
+	out := make([]MoneyTotal, 0, len(by))
+	for _, t := range by {
+		out = append(out, *t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AmountMinor != out[j].AmountMinor {
+			return out[i].AmountMinor > out[j].AmountMinor
+		}
+		return out[i].Currency < out[j].Currency
+	})
+	return out
+}
+
+// MoneyText renders totals as "1,250.00 USD + 500 JPY", or "" when none.
+func MoneyText(ts []MoneyTotal) string {
+	parts := make([]string, len(ts))
+	for i, t := range ts {
+		parts[i] = t.String()
+	}
+	return strings.Join(parts, " + ")
 }
 
 // Build assembles a report. relay may be nil.
@@ -59,6 +111,7 @@ func Build(seed uint64, a *audit.Auditor, relay *webhook.Relay) Report {
 	if r.Findings == nil {
 		r.Findings = []audit.Finding{}
 	}
+	r.MoneyAtRisk = AtRisk(r.Findings)
 	return r
 }
 
@@ -107,9 +160,17 @@ func (r Report) WriteText(w io.Writer) {
 	for _, f := range r.Findings {
 		counts[f.Severity]++
 	}
-	fmt.Fprintf(w, "Findings: %d high, %d medium, %d low\n\n", counts[audit.High], counts[audit.Medium], counts[audit.Low])
+	fmt.Fprintf(w, "Findings: %d high, %d medium, %d low\n", counts[audit.High], counts[audit.Medium], counts[audit.Low])
+	if m := MoneyText(r.MoneyAtRisk); m != "" {
+		fmt.Fprintf(w, "Money at risk: %s\n", m)
+	}
+	fmt.Fprintln(w)
 	for _, f := range r.Findings {
-		fmt.Fprintf(w, "[%s] %s\n    %s\n", f.Severity, f.Code, f.Message)
+		risk := ""
+		if f.Currency != "" {
+			risk = " (" + money.Format(f.Amount()) + " at risk)"
+		}
+		fmt.Fprintf(w, "[%s] %s%s\n    %s\n", f.Severity, f.Code, risk, f.Message)
 	}
 	if len(r.Webhooks) > 0 {
 		dups, reord := 0, 0

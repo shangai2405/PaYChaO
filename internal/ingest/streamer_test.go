@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -159,34 +160,143 @@ func TestFullQueueSpillsWithoutBlocking(t *testing.T) {
 	}
 }
 
-// With the API down for the whole run, everything ends up in the spill file.
+// With the API down for the whole run, everything ends up in the spill file:
+// a run header, every event, and the finish, so it can be uploaded later.
 func TestAPIDownSpillsEverything(t *testing.T) {
 	s := newStreamer(t, "http://127.0.0.1:1", nil)
-	s.Start(RunMeta{})
+	s.Start(RunMeta{Name: "offline", Seed: 9})
 	for i := 0; i < 12; i++ {
 		s.Enqueue(Event{Kind: "finding", Finding: &audit.Finding{Code: audit.CodeMissingRequestID}})
 	}
 	time.Sleep(50 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	st, err := s.Close(ctx, Finish{})
+	st, err := s.Close(ctx, Finish{RequestCount: 3})
 	if err == nil {
 		t.Fatal("finish cannot succeed with the API down")
 	}
 	if st.Spilled != 12 || st.Sent != 0 {
 		t.Fatalf("stats %+v", st)
 	}
-	f, _ := os.Open(s.SpillPath())
-	defer f.Close()
-	n := 0
-	for sc := bufio.NewScanner(f); sc.Scan(); n++ {
+	lines := readLines(t, s.SpillPath())
+	if len(lines) != 14 {
+		t.Fatalf("spill has %d lines, want header + 12 events + finish", len(lines))
+	}
+	var head spillLine
+	if json.Unmarshal([]byte(lines[0]), &head) != nil || head.Kind != "run" || head.RunID != s.RunID() || head.Run.Name != "offline" {
+		t.Fatalf("bad header %q", lines[0])
+	}
+	for _, l := range lines[1:13] {
 		var ev Event
-		if json.Unmarshal(sc.Bytes(), &ev) != nil || ev.Kind != "finding" {
-			t.Fatalf("bad spill line %q", sc.Text())
+		if json.Unmarshal([]byte(l), &ev) != nil || ev.Kind != "finding" {
+			t.Fatalf("bad spill line %q", l)
 		}
 	}
-	if n != 12 {
-		t.Fatalf("spill has %d lines", n)
+	var fin spillLine
+	if json.Unmarshal([]byte(lines[13]), &fin) != nil || fin.Kind != "finish" || fin.Finish.RequestCount != 3 {
+		t.Fatalf("bad finish line %q", lines[13])
+	}
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var out []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		out = append(out, sc.Text())
+	}
+	return out
+}
+
+// A spill file written while the API was down uploads later through the same
+// idempotent endpoints, is deleted afterwards, and uploading a copy again
+// stores nothing twice.
+func TestUploadSpill(t *testing.T) {
+	s := newStreamer(t, "http://127.0.0.1:1", nil)
+	s.Start(RunMeta{Name: "offline", Seed: 9})
+	for i := 1; i <= 25; i++ {
+		s.Enqueue(Event{Kind: "request", Request: &audit.Record{Seq: i}})
+	}
+	s.Enqueue(Event{Kind: "finding", Finding: &audit.Finding{Code: audit.CodeMissingRequestID}})
+	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = s.Close(ctx, Finish{RequestCount: 25, Findings: []audit.Finding{{Code: audit.CodeUnsafeRetry}}})
+	copyPath := s.SpillPath() + ".copy"
+	b, _ := os.ReadFile(s.SpillPath())
+	_ = os.WriteFile(copyPath, b, 0o600)
+	t.Cleanup(func() { os.Remove(copyPath) })
+
+	api := newFakeAPI()
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	opt := Options{BaseURL: srv.URL, Token: "pct_test", BatchSize: 10}
+	res, err := UploadSpill(context.Background(), opt, s.SpillPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RunID != s.RunID() || res.Events != 25 || res.Batches != 3 || !res.Finished {
+		t.Fatalf("result %+v", res)
+	}
+	if _, err := os.Stat(s.SpillPath()); !os.IsNotExist(err) {
+		t.Fatal("uploaded spill file was not deleted")
+	}
+	if api.runs[s.RunID()].Name != "offline" || api.finished == nil || len(api.finished.Findings) != 1 {
+		t.Fatalf("run %+v finish %+v", api.runs, api.finished)
+	}
+	for seq, evs := range api.batches {
+		if seq < spillBatchBase {
+			t.Fatalf("spill batch numbered %d, could collide with live batches", seq)
+		}
+		for _, ev := range evs {
+			if ev.Kind == "finding" {
+				t.Fatal("provisional findings were uploaded although the finish replaces them")
+			}
+		}
+	}
+	if _, err := UploadSpill(context.Background(), opt, copyPath); err != nil {
+		t.Fatal(err)
+	}
+	if api.events() != 25 || len(api.batches) != 3 {
+		t.Fatalf("second upload stored again: %d events in %d batches", api.events(), len(api.batches))
+	}
+}
+
+func TestUploadSpillRejectsHeaderlessFiles(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "paychaos-spill-old.ndjson")
+	_ = os.WriteFile(p, []byte(`{"kind":"request","request":{"seq":1}}`+"\n"), 0o600)
+	if _, err := UploadSpill(context.Background(), Options{BaseURL: "http://x", Token: "t"}, p); !errors.Is(err, ErrNoSpillHeader) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("a file that could not be uploaded must be kept")
+	}
+}
+
+func TestPendingSpills(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string, age time.Duration) {
+		p := filepath.Join(dir, name)
+		_ = os.WriteFile(p, []byte(body), 0o600)
+		_ = os.Chtimes(p, time.Now().Add(-age), time.Now().Add(-age))
+	}
+	write("paychaos-spill-a.ndjson", `{"kind":"run","run_id":"a","run":{}}`+"\n"+`{"kind":"finish","finish":{}}`+"\n", 0)
+	write("paychaos-spill-b.ndjson", `{"kind":"run","run_id":"b","run":{}}`+"\n", 0)         // still being written
+	write("paychaos-spill-c.ndjson", `{"kind":"run","run_id":"c","run":{}}`+"\n", time.Hour) // crashed run
+	write("other.ndjson", `{}`, time.Hour)
+	got, err := PendingSpills(dir, 10*time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(dir, "paychaos-spill-a.ndjson"), filepath.Join(dir, "paychaos-spill-c.ndjson")}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("pending %v, want %v", got, want)
 	}
 }
 

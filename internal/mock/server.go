@@ -59,6 +59,9 @@ type Options struct {
 	// StrictTokens rejects bearer tokens the mock did not issue. Off by
 	// default so tests can use any token.
 	StrictTokens bool
+	// Profile makes the mock answer like a measured sandbox (see
+	// verify-sandbox). Nil keeps the mock's assumptions.
+	Profile *Profile
 }
 
 type money struct {
@@ -338,13 +341,21 @@ func (s *Server) post(w http.ResponseWriter, r *http.Request, client string, p [
 				// PayPal returns the latest status of the earlier request's
 				// resource, not a cached copy of its first response.
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(m.status)
+				status := m.status
+				if rs := s.behaviour().ReplayStatus; rs != nil {
+					status = *rs
+				}
+				w.WriteHeader(status)
 				_ = json.NewEncoder(w).Encode(s.current(m.kind, m.id))
 				return
 			}
 		}
 		s.inflight[cacheKey] = true
 		defer delete(s.inflight, cacheKey)
+	}
+	if a, ok := s.measuredRefusal(p, reqID, body); ok {
+		paypalErr(w, a.Status, "UNPROCESSABLE_ENTITY", a.Issue, "paychaos mock: answer measured in the sandbox (see the provider profile)")
+		return
 	}
 	if s.opt.ExecDelay > 0 {
 		s.mu.Unlock()
@@ -454,6 +465,9 @@ func (s *Server) captureOrder(id string) (string, string, int, any) {
 	}
 	switch o.Status {
 	case "COMPLETED":
+		if a := s.behaviour().AlreadyCaptured; a != nil {
+			return "", "", a.Status, errBody("UNPROCESSABLE_ENTITY", a.Issue, "Order already captured (status and issue measured in the sandbox).")
+		}
 		return "", "", http.StatusUnprocessableEntity, errBody("UNPROCESSABLE_ENTITY", "ORDER_ALREADY_CAPTURED", "Order already captured. If 'intent=CAPTURE' only one capture per order is allowed.")
 	case "CREATED":
 		return "", "", http.StatusUnprocessableEntity, errBody("UNPROCESSABLE_ENTITY", "ORDER_NOT_APPROVED", "Payer has not yet approved the Order for payment.")
@@ -644,4 +658,27 @@ func paypalErr(w http.ResponseWriter, status int, name, issue, msg string) {
 
 func notFound(w http.ResponseWriter) {
 	paypalErr(w, http.StatusNotFound, "RESOURCE_NOT_FOUND", "", "The requested resource was not found.")
+}
+
+// measuredRefusal applies refusals a sandbox profile recorded that the mock
+// does not make by default. Called with s.mu held.
+func (s *Server) measuredRefusal(p []string, reqID string, body []byte) (Answer, bool) {
+	if reqID != "" {
+		return Answer{}, false
+	}
+	b := s.behaviour()
+	switch {
+	case len(p) == 5 && p[2] == "captures" && p[4] == "refund" && b.RepeatRefundWithoutID != nil && b.RepeatRefundWithoutID.Status >= 400:
+		if c, ok := s.captures[p[3]]; ok && c.refunded > 0 {
+			return *b.RepeatRefundWithoutID, true
+		}
+	case len(p) == 3 && p[2] == "orders" && b.CreateOrderWithSourceWithoutID != nil && b.CreateOrderWithSourceWithoutID.Status >= 400:
+		var req struct {
+			PaymentSource json.RawMessage `json:"payment_source"`
+		}
+		if json.Unmarshal(body, &req) == nil && len(req.PaymentSource) > 0 && string(req.PaymentSource) != "null" {
+			return *b.CreateOrderWithSourceWithoutID, true
+		}
+	}
+	return Answer{}, false
 }

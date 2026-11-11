@@ -4,7 +4,9 @@ import { z } from 'zod';
 import { hashToken, newToken } from '../auth.js';
 import { HttpError, notFound } from '../errors.js';
 import { decodeCursor, encodeCursor } from '../pagination.js';
+import { verdictFor } from '../verdict.js';
 import {
+  issuePatchSchema,
   listQuerySchema,
   projectBodySchema,
   projectPatchSchema,
@@ -15,7 +17,10 @@ import {
 } from '../schemas.js';
 
 const RUN_COLUMNS = `id, project_id, name, seed::text AS seed, upstream, engine_version, status, started_at, finished_at,
-  request_count, high, medium, low, faults_applied, started_at::text AS cursor_ts`;
+  request_count, high, medium, low, faults_applied, money_at_risk, scenario_name, scenario_version,
+  ci_provider, repo, branch, commit_sha, pr_number, base_branch, ci_url, started_at::text AS cursor_ts`;
+
+const PROJECT_COLUMNS = 'id, name, description, default_branch, created_at';
 
 function stripCursor<T extends { cursor_ts?: string }>(row: T): Omit<T, 'cursor_ts'> {
   const { cursor_ts: _ignored, ...rest } = row;
@@ -23,7 +28,7 @@ function stripCursor<T extends { cursor_ts?: string }>(row: T): Omit<T, 'cursor_
 }
 
 async function getProject(pool: pg.Pool, id: string) {
-  const { rows } = await pool.query('SELECT id, name, description, created_at FROM projects WHERE id = $1', [uuid.parse(id)]);
+  const { rows } = await pool.query(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE id = $1`, [uuid.parse(id)]);
   if (!rows[0]) throw notFound('project');
   return rows[0];
 }
@@ -82,15 +87,17 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     const { rows } = await pool.query(
       // The latest finished run's counts give each project a health status
       // on the overview without a request per project.
-      `SELECT p.id, p.name, p.description, p.created_at,
+      `SELECT p.id, p.name, p.description, p.default_branch, p.created_at,
               (SELECT count(*)::int FROM runs r WHERE r.project_id = p.id) AS run_count,
               (SELECT max(started_at) FROM runs r WHERE r.project_id = p.id) AS last_run_at,
               CASE WHEN l.id IS NULL THEN NULL
                    ELSE jsonb_build_object('id', l.id, 'name', l.name, 'started_at', l.started_at,
-                                           'high', l.high, 'medium', l.medium, 'low', l.low) END AS latest
+                                           'high', l.high, 'medium', l.medium, 'low', l.low,
+                                           'money_at_risk', l.money_at_risk) END AS latest,
+              (SELECT count(*)::int FROM issues i WHERE i.project_id = p.id AND i.status <> 'fixed' AND i.ignored_at IS NULL) AS open_issues
        FROM projects p
        LEFT JOIN LATERAL (
-         SELECT id, name, started_at, high, medium, low FROM runs r
+         SELECT id, name, started_at, high, medium, low, money_at_risk FROM runs r
          WHERE r.project_id = p.id AND r.status = 'finished'
          ORDER BY started_at DESC, id DESC LIMIT 1
        ) l ON true
@@ -103,7 +110,7 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     const body = projectBodySchema.parse(req.body);
     try {
       const { rows } = await pool.query(
-        'INSERT INTO projects (name, description) VALUES ($1, $2) RETURNING id, name, description, created_at',
+        `INSERT INTO projects (name, description) VALUES ($1, $2) RETURNING ${PROJECT_COLUMNS}`,
         [body.name, body.description],
       );
       reply.code(201);
@@ -121,9 +128,10 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     const body = projectPatchSchema.parse(req.body ?? {});
     try {
       const { rows } = await pool.query(
-        `UPDATE projects SET name = coalesce($2, name), description = coalesce($3, description) WHERE id = $1
-         RETURNING id, name, description, created_at`,
-        [id, body.name ?? null, body.description ?? null],
+        `UPDATE projects SET name = coalesce($2, name), description = coalesce($3, description),
+                default_branch = coalesce($4, default_branch)
+         WHERE id = $1 RETURNING ${PROJECT_COLUMNS}`,
+        [id, body.name ?? null, body.description ?? null, body.default_branch ?? null],
       );
       if (!rows[0]) throw notFound('project');
       return rows[0];
@@ -143,7 +151,8 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     const project = await getProject(pool, req.params.id);
     const { limit } = z.object({ limit: z.coerce.number().int().min(2).max(100).optional().default(30) }).parse(req.query);
     const { rows: recent } = await pool.query(
-      `SELECT id, name, seed::text AS seed, started_at, finished_at, request_count, high, medium, low
+      `SELECT id, name, seed::text AS seed, started_at, finished_at, request_count, high, medium, low, money_at_risk,
+              branch, pr_number
        FROM runs WHERE project_id = $1 AND status = 'finished'
        ORDER BY started_at DESC, id DESC LIMIT $2`,
       [project.id, limit],
@@ -179,7 +188,12 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
       };
     }
     const status = !latest ? 'no_runs' : latest.high > 0 ? 'failing' : latest.medium > 0 ? 'warning' : 'passing';
-    return { project, status, runs, codes, latest, change };
+    const { rows: issueCounts } = await pool.query(
+      `SELECT status, count(*)::int AS n FROM issues WHERE project_id = $1 AND ignored_at IS NULL GROUP BY status`,
+      [project.id],
+    );
+    const issues = Object.fromEntries(['new', 'open', 'regressed', 'fixed'].map((s) => [s, issueCounts.find((r) => r.status === s)?.n ?? 0]));
+    return { project, status, runs, codes, latest, change, issues };
   });
 
   app.delete<{ Params: { id: string } }>('/api/projects/:id', async (req, reply) => {
@@ -257,9 +271,11 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     const run = await getRun(pool, req.params.id);
     const sev = z.enum(SEVERITIES).optional().parse(req.query.severity?.toUpperCase());
     const { rows } = await pool.query(
-      `SELECT id, code, severity, message, path, operation, fingerprint, requests, object_ids, at, final
-       FROM findings WHERE run_id = $1 AND ($2::text IS NULL OR severity = $2)
-       ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, at, id`,
+      `SELECT f.id, f.code, f.severity, f.message, f.path, f.operation, f.fingerprint, f.requests, f.object_ids, f.at, f.final,
+              f.amount_minor, f.currency, f.issue_id, i.status AS issue_status, i.ignored_at AS issue_ignored_at
+       FROM findings f LEFT JOIN issues i ON i.id = f.issue_id
+       WHERE f.run_id = $1 AND ($2::text IS NULL OR f.severity = $2)
+       ORDER BY CASE f.severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, f.amount_minor DESC NULLS LAST, f.at, f.id`,
       [run.id, sev ?? null],
     );
     return { findings: rows, final: run.status === 'finished' };
@@ -273,7 +289,7 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
       .parse(req.query);
     const { rows } = await pool.query(
       `SELECT seq, at, done, method, path, operation, request_id, fingerprint, rule, fault, upstream_status, issue,
-              object_id, committed, response_delivered
+              object_id, committed, response_delivered, amount_minor, currency
        FROM requests WHERE run_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`,
       [run.id, q.after, q.limit + 1],
     );
@@ -295,7 +311,8 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
                 jsonb_agg(jsonb_build_object(
                   'seq', seq, 'at', at, 'done', done, 'method', method, 'path', path, 'request_id', request_id,
                   'fault', fault, 'upstream_status', upstream_status, 'issue', issue, 'object_id', object_id,
-                  'committed', committed, 'response_delivered', response_delivered) ORDER BY seq) AS timeline,
+                  'committed', committed, 'response_delivered', response_delivered,
+                  'amount_minor', amount_minor, 'currency', currency) ORDER BY seq) AS timeline,
                 (array_agg(operation ORDER BY seq))[1] AS operation,
                 (array_agg(path ORDER BY seq))[1] AS path,
                 count(DISTINCT nullif(object_id, '')) FILTER (WHERE committed)::int AS created
@@ -316,6 +333,52 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
       [run.id],
     );
     return { operations: rows };
+  });
+
+  app.get<{ Params: { id: string } }>('/api/runs/:id/verdict', async (req) => verdictFor(pool, uuid.parse(req.params.id)));
+
+  // ---- issues -----------------------------------------------------------
+  app.get<{ Params: { id: string } }>('/api/projects/:id/issues', async (req) => {
+    const project = await getProject(pool, req.params.id);
+    const q = z
+      .object({
+        status: z.enum(['active', 'new', 'open', 'regressed', 'fixed', 'ignored', 'all']).optional().default('active'),
+      })
+      .parse(req.query);
+    const where: Record<typeof q.status, string> = {
+      active: `status <> 'fixed' AND ignored_at IS NULL`,
+      new: `status = 'new' AND ignored_at IS NULL`,
+      open: `status = 'open' AND ignored_at IS NULL`,
+      regressed: `status = 'regressed' AND ignored_at IS NULL`,
+      fixed: `status = 'fixed'`,
+      ignored: 'ignored_at IS NOT NULL',
+      all: 'true',
+    };
+    const { rows } = await pool.query(
+      `SELECT i.id, i.key, i.code, i.severity, i.operation, i.path, i.message, i.status, i.times_seen,
+              i.first_seen_run, i.first_seen_at, i.last_seen_run, i.last_seen_at, i.fixed_run, i.fixed_at, i.regressed_at,
+              i.amount_minor, i.currency, i.ignored_at, i.ignored_reason
+       FROM issues i WHERE i.project_id = $1 AND ${where[q.status]}
+       ORDER BY CASE i.status WHEN 'regressed' THEN 0 WHEN 'new' THEN 1 WHEN 'open' THEN 2 ELSE 3 END,
+                CASE i.severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END,
+                i.amount_minor DESC NULLS LAST, i.last_seen_at DESC
+       LIMIT 500`,
+      [project.id],
+    );
+    return { issues: rows, default_branch: project.default_branch };
+  });
+
+  app.patch<{ Params: { id: string } }>('/api/issues/:id', async (req) => {
+    const id = z.coerce.number().int().positive().parse(req.params.id);
+    const body = issuePatchSchema.parse(req.body ?? {});
+    const { rows } = await pool.query(
+      `UPDATE issues SET ignored_at = CASE WHEN $2 THEN coalesce(ignored_at, now()) ELSE NULL END,
+              ignored_reason = CASE WHEN $2 THEN $3 ELSE '' END
+       WHERE id = $1 RETURNING id, status, ignored_at, ignored_reason`,
+      [id, body.ignored, body.reason],
+    );
+    if (!rows[0]) throw notFound('issue');
+    return rows[0];
   });
 
   app.get<{ Params: { id: string } }>('/api/runs/:id/webhooks', async (req) => {
@@ -348,7 +411,7 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
   app.get<{ Params: { id: string } }>('/api/projects/:id/scenarios', async (req) => {
     await getProject(pool, req.params.id);
     const { rows } = await pool.query(
-      'SELECT id, name, config, created_at, updated_at FROM scenarios WHERE project_id = $1 ORDER BY name',
+      'SELECT id, name, version, config, created_at, updated_at FROM scenarios WHERE project_id = $1 ORDER BY name',
       [req.params.id],
     );
     return { scenarios: rows };
@@ -360,7 +423,7 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
     try {
       const { rows } = await pool.query(
         `INSERT INTO scenarios (project_id, name, config) VALUES ($1, $2, $3)
-         RETURNING id, name, config, created_at, updated_at`,
+         RETURNING id, name, version, config, created_at, updated_at`,
         [req.params.id, body.name, JSON.stringify(body.config)],
       );
       reply.code(201);
@@ -374,8 +437,10 @@ export async function dashboardRoutes(app: FastifyInstance, pool: pg.Pool): Prom
   app.put<{ Params: { id: string } }>('/api/scenarios/:id', async (req) => {
     const body = scenarioBodySchema.parse(req.body);
     const { rows } = await pool.query(
-      `UPDATE scenarios SET name = $2, config = $3, updated_at = now() WHERE id = $1
-       RETURNING id, name, config, created_at, updated_at`,
+      `UPDATE scenarios SET name = $2, config = $3, updated_at = now(),
+              version = version + CASE WHEN config IS DISTINCT FROM $3::jsonb THEN 1 ELSE 0 END
+       WHERE id = $1
+       RETURNING id, name, version, config, created_at, updated_at`,
       [uuid.parse(req.params.id), body.name, JSON.stringify(body.config)],
     );
     if (!rows[0]) throw notFound('scenario');

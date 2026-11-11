@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type pg from 'pg';
 import { z } from 'zod';
 import { notFound } from '../errors.js';
+import { formatMoney, moneyText, totals } from '../money.js';
 import { uuid } from '../schemas.js';
 
 interface ExportFinding {
@@ -13,7 +14,11 @@ interface ExportFinding {
   requests: number[];
   object_ids: string[];
   at: string;
+  amount_minor?: string | number | null;
+  currency?: string | null;
 }
+
+const risk = (f: ExportFinding) => (f.currency && f.amount_minor != null ? formatMoney(f.amount_minor, f.currency) : '');
 
 interface ExportRun {
   id: string;
@@ -40,6 +45,7 @@ const mdCell = (s: string) => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 export function toJUnit(run: ExportRun, findings: ExportFinding[]): string {
   const cases = findings.map((f, i) => {
     let body = f.message;
+    if (risk(f)) body += `\nat risk: ${risk(f)}`;
     if (f.object_ids.length) body += `\nobjects: ${f.object_ids.join(', ')}`;
     if (f.requests.length) body += `\nrequests: ${hashList(f.requests)}`;
     const name = `${String(i + 1).padStart(3, '0')} ${f.code} ${f.path}`;
@@ -69,6 +75,8 @@ export function toMarkdown(run: ExportRun, findings: ExportFinding[]): string {
     `**${run.request_count}** audited payment requests · **${n('HIGH')} high**, ${n('MEDIUM')} medium, ${n('LOW')} low findings`,
     '',
   ];
+  const atRisk = moneyText(totals(findings));
+  if (atRisk) lines.push(`**Money at risk: ${atRisk}**`, '');
   const faults = Object.entries(run.faults_applied)
     .map(([f, c]) => `\`${f}\` × ${c}`)
     .sort();
@@ -77,10 +85,10 @@ export function toMarkdown(run: ExportRun, findings: ExportFinding[]): string {
   if (findings.length === 0) {
     lines.push('No retry-safety problems detected in this run.');
   } else {
-    lines.push('| Severity | Code | Path | Requests | Objects | Detail |', '|---|---|---|---|---|---|');
+    lines.push('| Severity | Code | At risk | Path | Requests | Objects | Detail |', '|---|---|---|---|---|---|---|');
     for (const f of findings) {
       lines.push(
-        `| ${f.severity} | \`${f.code}\` | \`${mdCell(f.path)}\` | ${hashList(f.requests)} | ${mdCell(f.object_ids.join(', '))} | ${mdCell(f.message)} |`,
+        `| ${f.severity} | \`${f.code}\` | ${risk(f)} | \`${mdCell(f.path)}\` | ${hashList(f.requests)} | ${mdCell(f.object_ids.join(', '))} | ${mdCell(f.message)} |`,
       );
     }
   }
@@ -112,14 +120,14 @@ export async function exportRoutes(app: FastifyInstance, pool: pg.Pool): Promise
     const { format } = z.object({ format: z.enum(['json', 'junit', 'markdown']).default('json') }).parse(req.query);
     const { rows } = await pool.query<ExportRun & { scenario: unknown; webhooks: unknown }>(
       `SELECT id, name, seed::text AS seed, upstream, status, started_at, finished_at, request_count,
-              faults_applied, webhook_notes, scenario, webhooks
+              faults_applied, webhook_notes, scenario, webhooks, money_at_risk
        FROM runs WHERE id = $1`,
       [id],
     );
     const run = rows[0];
     if (!run) throw notFound('run');
     const { rows: findings } = await pool.query<ExportFinding>(
-      `SELECT code, severity, message, path, operation, requests, object_ids, at
+      `SELECT code, severity, message, path, operation, requests, object_ids, at, amount_minor, currency
        FROM findings WHERE run_id = $1
        ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, at, id`,
       [id],
@@ -138,7 +146,7 @@ export async function exportRoutes(app: FastifyInstance, pool: pg.Pool): Promise
     const [{ rows: requests }, { rows: deliveries }] = await Promise.all([
       pool.query(
         `SELECT seq, at, done, method, path, operation, request_id, fingerprint, rule, fault, upstream_status, issue,
-                object_id, committed, response_delivered
+                object_id, committed, response_delivered, amount_minor, currency
          FROM requests WHERE run_id = $1 ORDER BY seq`,
         [id],
       ),

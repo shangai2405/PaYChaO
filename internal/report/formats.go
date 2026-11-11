@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/shangai2405/paychaos/internal/audit"
+	"github.com/shangai2405/paychaos/internal/money"
 )
 
 // JUnit output follows the de facto schema most CI systems (GitHub Actions
@@ -62,6 +63,9 @@ func (r Report) EncodeJUnit(w io.Writer) error {
 	}
 	for i, f := range r.Findings {
 		body := f.Message
+		if f.Currency != "" {
+			body += "\nat risk: " + money.Format(f.Amount())
+		}
 		if len(f.ObjectIDs) > 0 {
 			body += "\nobjects: " + strings.Join(f.ObjectIDs, ", ")
 		}
@@ -104,6 +108,9 @@ func (r Report) WriteMarkdown(w io.Writer) {
 	fmt.Fprintf(w, "## paychaos report (seed %d)\n\n", r.Seed)
 	fmt.Fprintf(w, "**%d** audited payment requests · **%d high**, %d medium, %d low findings\n\n",
 		r.RequestCount, counts[audit.High], counts[audit.Medium], counts[audit.Low])
+	if m := MoneyText(AtRisk(r.Findings)); m != "" {
+		fmt.Fprintf(w, "**Money at risk: %s**\n\n", m)
+	}
 
 	if len(r.FaultsApplied) > 0 {
 		faults := make([]string, 0, len(r.FaultsApplied))
@@ -117,11 +124,15 @@ func (r Report) WriteMarkdown(w io.Writer) {
 	if len(r.Findings) == 0 {
 		fmt.Fprintln(w, "No retry-safety problems detected in this run.")
 	} else {
-		fmt.Fprintln(w, "| Severity | Code | Path | Requests | Objects | Detail |")
-		fmt.Fprintln(w, "|---|---|---|---|---|---|")
+		fmt.Fprintln(w, "| Severity | Code | At risk | Path | Requests | Objects | Detail |")
+		fmt.Fprintln(w, "|---|---|---|---|---|---|---|")
 		for _, f := range r.Findings {
-			fmt.Fprintf(w, "| %s | `%s` | `%s` | %s | %s | %s |\n",
-				f.Severity, f.Code, f.Path, joinInts(f.Requests), mdCell(strings.Join(f.ObjectIDs, ", ")), mdCell(f.Message))
+			risk := ""
+			if f.Currency != "" {
+				risk = money.Format(f.Amount())
+			}
+			fmt.Fprintf(w, "| %s | `%s` | %s | `%s` | %s | %s | %s |\n",
+				f.Severity, f.Code, risk, f.Path, joinInts(f.Requests), mdCell(strings.Join(f.ObjectIDs, ", ")), mdCell(f.Message))
 		}
 	}
 

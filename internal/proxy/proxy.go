@@ -22,6 +22,7 @@ import (
 
 	"github.com/shangai2405/paychaos/internal/audit"
 	"github.com/shangai2405/paychaos/internal/chaos"
+	"github.com/shangai2405/paychaos/internal/money"
 )
 
 const maxBody = 1 << 20 // PayPal request bodies are small JSON documents
@@ -162,10 +163,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.opt.Auditor.TokenUsed(tokenLabel, r.Method, r.URL.Path, seq)
 
 	d := p.opt.Engine.Decide(r.Method, r.URL.Path)
+	var moved money.Amount // set once the upstream's response is read
 	complete := func(status int, committed bool, objectID, issue string) {
 		if audited {
 			p.opt.Auditor.CompleteWith(seq, audit.Outcome{Rule: d.Rule, Fault: d.Fault, UpstreamStatus: status,
-				Committed: committed, ObjectID: objectID, Issue: issue})
+				Committed: committed, ObjectID: objectID, Issue: issue, Amount: moved})
 		}
 	}
 	log := p.opt.Logger.With("seq", seq, "method", r.Method, "path", r.URL.Path, "fault", d.Fault, "rule", d.Rule)
@@ -242,6 +244,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	objectID, issue := "", ""
 	if committed {
 		objectID = CreatedID(respBody)
+		if audited {
+			moved, _ = money.FromResponse(audit.Operation(r.Method, r.URL.Path), respBody)
+		}
 	} else {
 		issue = errorIssue(respBody)
 	}
